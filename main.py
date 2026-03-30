@@ -4,7 +4,7 @@ import requests
 import asyncio
 import time
 
-# [v2.5.5 엔진 기반] 클라이언트 설정
+# [v2.9.2 순정] 클라이언트 설정
 @st.cache_resource
 def setup_clients():
     g_key = st.secrets.get("GEMINI_KEY")
@@ -23,7 +23,7 @@ def setup_clients():
 
 GEMINI_KEY, OR_KEY, GROQ_KEY, VALID_GEMINI = setup_clients()
 
-# 서비스별 우선순위 (고성능 -> 효율성 모델 순)
+# [v2.9.2 순정] 모델 우선순위
 PRIORITY_MAP = {
     "Gemini": VALID_GEMINI,
     "Groq": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
@@ -50,7 +50,7 @@ def apply_style():
         </style>
     """, unsafe_allow_html=True)
 
-# [핵심] 전 모델 자동 우회 엔진 (v2.5.5 연결부 계승)
+# [수정] 3,4,5,6번 호출 실패 해결을 위한 강화된 통신 로직
 def sync_api_call(family, model_id, prompt):
     if not prompt.strip(): return ""
     session = requests.Session()
@@ -72,14 +72,26 @@ def sync_api_call(family, model_id, prompt):
                 if 'choices' in res:
                     tag = "" if current_model == model_id else f"\n\n*(자동우회: {current_model})*"
                     return res['choices'][0]['message']['content'] + tag
-            else: # OpenRouter
+            else: # [핵심 패치] OpenRouter 계열 (3,4,5,6번)
                 r = session.post("https://openrouter.ai/api/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {OR_KEY}", "HTTP-Referer": "http://localhost:8501"},
-                    json={"model": current_model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 800}, timeout=30)
-                res = r.json()
-                if 'choices' in res:
+                    headers={
+                        "Authorization": f"Bearer {OR_KEY}",
+                        "HTTP-Referer": "https://streamlit.io",
+                        "X-Title": "AI Expert Arena"
+                    },
+                    json={
+                        "model": current_model, 
+                        "messages": [{"role": "user", "content": prompt}], 
+                        "max_tokens": 1000,
+                        "route": "fallback" 
+                    }, timeout=50) # 타임아웃 50초로 증설
+                
+                if r.status_code == 200:
+                    res = r.json()
                     tag = "" if current_model == model_id else f"\n\n*(자동우회: {current_model})*"
                     return res['choices'][0]['message']['content'] + tag
+                elif r.status_code == 402: return "⚠️ 잔액 부족: OpenRouter 결제가 필요합니다."
+                elif r.status_code == 401: return "⚠️ 인증 실패: API 키를 확인해주세요."
             continue
         except Exception: continue
     return f"⚠️ {family}: 모든 후보 모델 호출 실패"
@@ -98,7 +110,7 @@ def main():
     if 'res_list' not in st.session_state: st.session_state.res_list = [""] * num_models
     if 'last_in' not in st.session_state: st.session_state.last_in = [""] * num_models
 
-    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v2.9.2)</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v2.9.2-Rev)</h2>", unsafe_allow_html=True)
     
     with st.sidebar:
         st.write("### ⚙️ 모델 설정")
@@ -111,9 +123,8 @@ def main():
 
     main_q = st.text_area("Global Input", placeholder="고성능 모델부터 순차적으로 시도합니다...", label_visibility="collapsed", key="g_input", height=100)
     
-    # [수정] 메인 질문 실행 시 이전 종합 의견 초기화 로직 추가
     if st.button("🔍 모든 AI 답변 동시 시작", use_container_width=True) and main_q.strip():
-        # 이전 요약 결과 초기화
+        # [v2.9.2 핵심] 이전 요약 결과 초기화
         if 'summary_res' in st.session_state:
             del st.session_state.summary_res
         
@@ -130,6 +141,7 @@ def main():
         fam = f_names[i]
         with cols[i % 2]:
             st.markdown(f'''<div class="res-card"><span class="model-info">{i+1}. {fam} • {selected[fam].split("/")[-1]}</span>{st.session_state.res_list[i] if st.session_state.res_list[i] else "..."}</div>''', unsafe_allow_html=True)
+            # [v2.9.2 핵심] 개별 질문창
             ind_q = st.text_input(f"q_{i}", key=f"ind_{i}", placeholder=f"{fam} 전용 질문", label_visibility="collapsed")
             if ind_q.strip() and ind_q != st.session_state.last_in[i]:
                 st.session_state.last_in[i] = ind_q

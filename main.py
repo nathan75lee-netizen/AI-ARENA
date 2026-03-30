@@ -3,22 +3,23 @@ import google.generativeai as genai
 import requests
 import asyncio
 
-# [v2.4.0] 404 오류 해결 & 런타임 안정화 & 반응형 레이아웃 통합본
+# [v2.4.1] Gemini 404 Not Found 긴급 패치 및 호출 경로 최적화
 @st.cache_resource
 def setup_clients():
     g_key = st.secrets.get("GEMINI_KEY")
     or_key = st.secrets.get("OR_KEY")
     gr_key = st.secrets.get("GROQ_KEY")
     if g_key:
-        try: genai.configure(api_key=g_key)
+        try:
+            genai.configure(api_key=g_key)
         except: pass
     return g_key, or_key, gr_key
 
 GEMINI_KEY, OR_KEY, GROQ_KEY = setup_clients()
 
-# 404 에러 방지를 위해 검증된 최신 모델명으로 구성
+# 구글 API 서버에서 가장 안정적으로 인식하는 모델명 리스트
 MODEL_CONFIG = {
-    "Gemini": ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash-exp"],
+    "Gemini": ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"],
     "Groq": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
     "GPT": ["openai/gpt-4o-mini", "openai/gpt-4o"],
     "Claude": ["anthropic/claude-3-haiku", "anthropic/claude-3.5-sonnet"],
@@ -34,7 +35,7 @@ def apply_style():
         .block-container { max-width: 100% !important; padding: 1rem 2% !important; background-color: #f8fafc; }
         .res-card {
             background: white; border: 1px solid #e2e8f0; border-radius: 12px; 
-            padding: 16px; margin-bottom: 8px; min-height: 120px; max-height: 350px; 
+            padding: 16px; margin-bottom: 8px; min-height: 120px; max-height: 400px; 
             overflow-y: auto; font-size: 14px; border-left: 6px solid #3b82f6;
             box-shadow: 0 2px 4px rgba(0,0,0,0.05);
         }
@@ -46,18 +47,19 @@ def apply_style():
         }
         @media (max-width: 768px) {
             .res-card { font-size: 15px !important; min-height: 100px; max-height: none; }
-            .stButton button { height: 4rem !important; font-size: 18px !important; }
         }
         </style>
     """, unsafe_allow_html=True)
 
 def sync_api_call(family, model_id, prompt):
-    """안정적인 동기식 API 호출"""
     if not prompt.strip(): return ""
     try:
         if family == "Gemini":
-            model = genai.GenerativeModel(model_name=model_id)
-            return model.generate_content(prompt).text
+            # 404 방지: 모델명에서 'models/' 접두사 제거 후 순수 이름만 사용
+            clean_name = model_id.replace("models/", "")
+            model = genai.GenerativeModel(model_name=clean_name)
+            response = model.generate_content(prompt)
+            return response.text
         elif family == "Groq":
             r = requests.post(
                 url="https://api.groq.com/openai/v1/chat/completions",
@@ -73,10 +75,9 @@ def sync_api_call(family, model_id, prompt):
                 timeout=30)
             return r.json()['choices'][0]['message']['content']
     except Exception as e:
-        return f"⚠️ 오류: {str(e)[:40]}..."
+        return f"⚠️ 오류: {str(e)[:50]}"
 
-async def async_render_worker(index, family, model_id, prompt, placeholders):
-    """전체 실행 시 실시간 개별 렌더링"""
+async def async_worker(index, family, model_id, prompt, placeholders):
     res = await asyncio.to_thread(sync_api_call, family, model_id, prompt)
     st.session_state.res_8[index] = res
     placeholders[index].markdown(f'''
@@ -99,31 +100,22 @@ def main():
         st.write("### ⚙️ 모델 설정")
         selected = {fam: st.selectbox(f"{fam}", cfg, key=f"sel_{fam}") for fam, cfg in MODEL_CONFIG.items()}
 
-    # 질문 입력창
-    main_q = st.text_area("Global Input", placeholder="모든 AI 모델에게 질문...", label_visibility="collapsed", key="g_input", height=100)
-    
+    main_q = st.text_area("Global Input", placeholder="전체 모델에게 질문...", label_visibility="collapsed", key="g_input", height=100)
     f_names = list(MODEL_CONFIG.keys())
     
-    # [1] 전체 실행 버튼 (상단 배치)
     if st.button("🔍 모든 AI 답변 듣기", use_container_width=True) and main_q.strip():
         cols = st.columns(2)
         placeholders = [cols[i % 2].empty() for i in range(8)]
-        
-        # 런타임 에러 방지용 루프 처리
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            loop.run_until_complete(asyncio.gather(*(async_render_worker(i, f_names[i], selected[f_names[i]], main_q, placeholders) for i in range(8))))
+            loop.run_until_complete(asyncio.gather(*(async_worker(i, f_names[i], selected[f_names[i]], main_q, placeholders) for i in range(8))))
             loop.close()
         except:
-            # 보조 실행 (루프 충돌 시)
-            for i in range(8):
-                st.session_state.res_8[i] = sync_api_call(f_names[i], selected[f_names[i]], main_q)
+            for i in range(8): st.session_state.res_8[i] = sync_api_call(f_names[i], selected[f_names[i]], main_q)
             st.rerun()
 
     st.divider()
-
-    # [2] 결과 카드 및 개별 질문창
     cols = st.columns(2)
     for i in range(8):
         with cols[i % 2]:
@@ -134,13 +126,10 @@ def main():
                     {st.session_state.res_8[i] if st.session_state.res_8[i] else "대기 중..."}
                 </div>
             ''', unsafe_allow_html=True)
-            
-            # 개별 질문창
-            ind_q = st.text_input(f"q_{i}", key=f"ind_{i}", placeholder=f"{fam} 전용 개별 질문 (Enter)", label_visibility="collapsed")
+            ind_q = st.text_input(f"q_{i}", key=f"ind_{i}", placeholder=f"{fam} 개별 질문 (Enter)", label_visibility="collapsed")
             if ind_q.strip() and ind_q != st.session_state.last_in[i]:
                 st.session_state.last_in[i] = ind_q
-                with st.spinner(f"{fam} 답변 중..."):
-                    st.session_state.res_8[i] = sync_api_call(fam, selected[fam], ind_q)
+                st.session_state.res_8[i] = sync_api_call(fam, selected[fam], ind_q)
                 st.rerun()
 
 if __name__ == "__main__":

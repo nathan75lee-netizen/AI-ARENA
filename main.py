@@ -3,51 +3,52 @@ import google.generativeai as genai
 import requests
 import asyncio
 
-# [v2.4.1] Gemini 404 Not Found 긴급 패치 및 호출 경로 최적화
+# [v2.5.0] 404 완전 방어: 실시간 가용 모델 리스트 스캔 로직 탑재
 @st.cache_resource
 def setup_clients():
     g_key = st.secrets.get("GEMINI_KEY")
     or_key = st.secrets.get("OR_KEY")
     gr_key = st.secrets.get("GROQ_KEY")
+    valid_gemini_models = []
+    
     if g_key:
         try:
             genai.configure(api_key=g_key)
-        except: pass
-    return g_key, or_key, gr_key
+            # 현재 키로 사용 가능한 실제 모델 리스트 가져오기
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    valid_gemini_models.append(m.name.replace("models/", ""))
+        except Exception as e:
+            st.sidebar.error(f"Gemini 초기화 실패: {e}")
+            
+    return g_key, or_key, gr_key, valid_gemini_models
 
-GEMINI_KEY, OR_KEY, GROQ_KEY = setup_clients()
+GEMINI_KEY, OR_KEY, GROQ_KEY, VALID_GEMINI = setup_clients()
 
-# 구글 API 서버에서 가장 안정적으로 인식하는 모델명 리스트
+# 기본 모델 구성 (VALID_GEMINI가 비어있을 경우를 대비한 백업)
+GEMINI_LIST = VALID_GEMINI if VALID_GEMINI else ["gemini-1.5-flash", "gemini-2.0-flash"]
+
 MODEL_CONFIG = {
-    "Gemini": ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"],
+    "Gemini": GEMINI_LIST,
     "Groq": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
     "GPT": ["openai/gpt-4o-mini", "openai/gpt-4o"],
     "Claude": ["anthropic/claude-3-haiku", "anthropic/claude-3.5-sonnet"],
     "Llama": ["meta-llama/llama-3.3-70b-instruct", "meta-llama/llama-3.2-3b-instruct:free"],
-    "Mistral": ["mistralai/mistral-nemo", "mistralai/mistral-7b-instruct-v0.3"],
-    "DeepSeek": ["deepseek/deepseek-r1:free", "deepseek/deepseek-chat"],
-    "Gemma": ["google/gemma-2-9b-it", "google/gemma-2-27b-it"]
+    "DeepSeek": ["deepseek/deepseek-r1:free", "deepseek/deepseek-chat"]
 }
 
 def apply_style():
     st.markdown("""
         <style>
-        .block-container { max-width: 100% !important; padding: 1rem 2% !important; background-color: #f8fafc; }
+        .block-container { max-width: 100% !important; padding: 1rem 2% !important; }
         .res-card {
             background: white; border: 1px solid #e2e8f0; border-radius: 12px; 
             padding: 16px; margin-bottom: 8px; min-height: 120px; max-height: 400px; 
             overflow-y: auto; font-size: 14px; border-left: 6px solid #3b82f6;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
         }
         .model-info { font-size: 11px; font-weight: 800; color: #1e40af; margin-bottom: 5px; display: block; }
-        .stButton button { 
-            background-color: #3b82f6 !important; color: white !important; 
-            font-weight: bold !important; border-radius: 10px !important;
-            height: 3.5rem; margin-bottom: 10px;
-        }
-        @media (max-width: 768px) {
-            .res-card { font-size: 15px !important; min-height: 100px; max-height: none; }
-        }
+        .stButton button { background-color: #3b82f6 !important; color: white !important; font-weight: bold !important; height: 3.5rem; }
+        @media (max-width: 768px) { .res-card { font-size: 15px !important; } }
         </style>
     """, unsafe_allow_html=True)
 
@@ -55,24 +56,21 @@ def sync_api_call(family, model_id, prompt):
     if not prompt.strip(): return ""
     try:
         if family == "Gemini":
-            # 404 방지: 모델명에서 'models/' 접두사 제거 후 순수 이름만 사용
-            clean_name = model_id.replace("models/", "")
-            model = genai.GenerativeModel(model_name=clean_name)
-            response = model.generate_content(prompt)
-            return response.text
+            # 접두사 중복 방지 (가장 안전한 호출 방식)
+            m_name = model_id.split('/')[-1]
+            model = genai.GenerativeModel(model_name=m_name)
+            return model.generate_content(prompt).text
         elif family == "Groq":
             r = requests.post(
                 url="https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                json={"model": model_id.split("/")[-1], "messages": [{"role": "user", "content": prompt}]},
-                timeout=15)
+                json={"model": model_id, "messages": [{"role": "user", "content": prompt}]}, timeout=15)
             return r.json()['choices'][0]['message']['content']
         else:
             r = requests.post(
                 url="https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OR_KEY}"},
-                json={"model": model_id, "messages": [{"role": "user", "content": prompt}]},
-                timeout=30)
+                json={"model": model_id, "messages": [{"role": "user", "content": prompt}]}, timeout=30)
             return r.json()['choices'][0]['message']['content']
     except Exception as e:
         return f"⚠️ 오류: {str(e)[:50]}"
@@ -82,22 +80,23 @@ async def async_worker(index, family, model_id, prompt, placeholders):
     st.session_state.res_8[index] = res
     placeholders[index].markdown(f'''
         <div class="res-card">
-            <span class="model-info">{index+1}. {family} • {model_id.split("/")[-1]}</span>
+            <span class="model-info">{index+1}. {family} • {model_id}</span>
             {res}
         </div>
     ''', unsafe_allow_html=True)
 
 def main():
-    st.set_page_config(page_title="AI Arena Pro", layout="wide")
+    st.set_page_config(page_title="AI Arena Zero-404", layout="wide")
     apply_style()
     
     if 'res_8' not in st.session_state: st.session_state.res_8 = [""] * 8
     if 'last_in' not in st.session_state: st.session_state.last_in = [""] * 8
 
-    st.markdown("<h2 style='text-align: center; margin-bottom: 0;'>⚡ AI Expert Arena</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert Arena</h2>", unsafe_allow_html=True)
     
     with st.sidebar:
         st.write("### ⚙️ 모델 설정")
+        # 동적으로 불러온 Gemini 리스트가 사이드바에 표시됨
         selected = {fam: st.selectbox(f"{fam}", cfg, key=f"sel_{fam}") for fam, cfg in MODEL_CONFIG.items()}
 
     main_q = st.text_area("Global Input", placeholder="전체 모델에게 질문...", label_visibility="collapsed", key="g_input", height=100)
@@ -122,7 +121,7 @@ def main():
             fam = f_names[i]
             st.markdown(f'''
                 <div class="res-card">
-                    <span class="model-info">{i+1}. {fam} • {selected[fam].split("/")[-1]}</span>
+                    <span class="model-info">{i+1}. {fam} • {selected[fam]}</span>
                     {st.session_state.res_8[i] if st.session_state.res_8[i] else "대기 중..."}
                 </div>
             ''', unsafe_allow_html=True)

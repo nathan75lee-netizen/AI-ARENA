@@ -4,7 +4,7 @@ import requests
 import asyncio
 import time
 
-# [v2.9.2] 클라이언트 설정 및 초기화
+# [v2.5.5 엔진 기반] 클라이언트 설정
 @st.cache_resource
 def setup_clients():
     g_key = st.secrets.get("GEMINI_KEY")
@@ -18,21 +18,21 @@ def setup_clients():
                 if 'generateContent' in m.supported_generation_methods:
                     valid_gemini.append(m.name.replace("models/", ""))
         except: pass
-    if not valid_gemini: valid_gemini = ["gemini-2.0-flash", "gemini-1.5-pro"]
+    if not valid_gemini: valid_gemini = ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"]
     return g_key, or_key, gr_key, valid_gemini
 
 GEMINI_KEY, OR_KEY, GROQ_KEY, VALID_GEMINI = setup_clients()
 
-# [수정] 할당량 부족 시 자동으로 이동할 무료(Free) 모델군 강화
+# 서비스별 우선순위 (고성능 -> 효율성 모델 순)
 PRIORITY_MAP = {
     "Gemini": VALID_GEMINI,
     "Groq": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
-    "GPT": ["openai/gpt-4o", "openai/gpt-4o-mini", "google/gemini-2.0-flash-001"],
-    "Claude": ["anthropic/claude-3.5-sonnet", "anthropic/claude-3-haiku:free", "openai/gpt-4o-mini"],
-    "Llama": ["meta-llama/llama-3.3-70b-instruct", "meta-llama/llama-3.3-70b-instruct:free", "meta-llama/llama-3.2-3b-instruct:free"],
-    "DeepSeek": ["deepseek/deepseek-chat", "deepseek/deepseek-r1:free", "deepseek/deepseek-chat:free"],
-    "Mistral": ["mistralai/pixtral-12b", "mistralai/mistral-nemo:free"],
-    "Gemma": ["google/gemma-2-27b-it", "google/gemma-2-9b-it:free"]
+    "GPT": ["openai/gpt-4o", "openai/gpt-4o-mini"],
+    "Claude": ["anthropic/claude-3.5-sonnet", "anthropic/claude-3-haiku"],
+    "Llama": ["meta-llama/llama-3.3-70b-instruct", "meta-llama/llama-3.2-3b-instruct:free"],
+    "DeepSeek": ["deepseek/deepseek-chat", "deepseek/deepseek-r1:free"],
+    "Mistral": ["mistralai/pixtral-12b", "mistralai/mistral-nemo"],
+    "Gemma": ["google/gemma-2-27b-it", "google/gemma-2-9b-it"]
 }
 
 def apply_style():
@@ -50,7 +50,7 @@ def apply_style():
         </style>
     """, unsafe_allow_html=True)
 
-# [핵심] 3,4,5,6번 호출 실패를 방지하는 지능형 우회 엔진
+# [핵심] 전 모델 자동 우회 엔진 (v2.5.5 연결부 계승)
 def sync_api_call(family, model_id, prompt):
     if not prompt.strip(): return ""
     session = requests.Session()
@@ -67,31 +67,22 @@ def sync_api_call(family, model_id, prompt):
             elif family == "Groq":
                 r = session.post("https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                    json={"model": current_model, "messages": [{"role": "user", "content": prompt}]}, timeout=20)
-                if r.status_code == 200:
+                    json={"model": current_model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1024}, timeout=20)
+                res = r.json()
+                if 'choices' in res:
                     tag = "" if current_model == model_id else f"\n\n*(자동우회: {current_model})*"
-                    return r.json()['choices'][0]['message']['content'] + tag
-            else: # [수정] OpenRouter (3,4,5,6번 모델)
+                    return res['choices'][0]['message']['content'] + tag
+            else: # OpenRouter
                 r = session.post("https://openrouter.ai/api/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {OR_KEY}",
-                        "HTTP-Referer": "https://streamlit.io", # 리퍼러 수정
-                        "X-Title": "AI Expert Arena"
-                    },
-                    json={
-                        "model": current_model, 
-                        "messages": [{"role": "user", "content": prompt}],
-                        "route": "fallback" # 유료 실패 시 무료 모델 자동 연결 시도
-                    }, timeout=50) # 타임아웃 50초로 대폭 연장
-                
-                if r.status_code == 200:
+                    headers={"Authorization": f"Bearer {OR_KEY}", "HTTP-Referer": "http://localhost:8501"},
+                    json={"model": current_model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 800}, timeout=30)
+                res = r.json()
+                if 'choices' in res:
                     tag = "" if current_model == model_id else f"\n\n*(자동우회: {current_model})*"
-                    return r.json()['choices'][0]['message']['content'] + tag
-                
-                # 만약 402(결제필요)나 429(할당량초과)가 나면 다음 후보(무료모델)로 넘어감
-                continue 
-        except: continue
-    return f"⚠️ {family}: 호출 실패 (무료 모델 포함)"
+                    return res['choices'][0]['message']['content'] + tag
+            continue
+        except Exception: continue
+    return f"⚠️ {family}: 모든 후보 모델 호출 실패"
 
 async def async_worker(index, family, model_id, prompt, placeholders):
     res = await asyncio.to_thread(sync_api_call, family, model_id, prompt)
@@ -107,7 +98,7 @@ def main():
     if 'res_list' not in st.session_state: st.session_state.res_list = [""] * num_models
     if 'last_in' not in st.session_state: st.session_state.last_in = [""] * num_models
 
-    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v2.9.2-Rev)</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v2.9.2)</h2>", unsafe_allow_html=True)
     
     with st.sidebar:
         st.write("### ⚙️ 모델 설정")
@@ -120,7 +111,9 @@ def main():
 
     main_q = st.text_area("Global Input", placeholder="고성능 모델부터 순차적으로 시도합니다...", label_visibility="collapsed", key="g_input", height=100)
     
+    # [수정] 메인 질문 실행 시 이전 종합 의견 초기화 로직 추가
     if st.button("🔍 모든 AI 답변 동시 시작", use_container_width=True) and main_q.strip():
+        # 이전 요약 결과 초기화
         if 'summary_res' in st.session_state:
             del st.session_state.summary_res
         
@@ -148,8 +141,8 @@ def main():
         valid_ans = "".join([f"[{f_names[i]}]: {st.session_state.res_list[i]}\n\n" for i in range(num_models) if st.session_state.res_list[i] and "⚠️" not in st.session_state.res_list[i]])
         if valid_ans:
             with st.spinner("정보의 일관성을 정밀 분석 중..."):
-                v_prompt = f"다음 답변들을 종합해서 결론 도출해줘:\n\n{valid_ans}"
-                st.session_state.summary_res = sync_api_call("Gemini", selected["Gemini"], v_prompt)
+                v_prompt = f"다음은 여러 AI 전문가의 답변입니다. 핵심 공통점과 상충되는 지점을 구분하여 최종 결론을 도출해줘:\n\n{valid_ans}"
+                st.session_state.summary_res = sync_api_call("Claude", selected["Claude"], v_prompt)
                 st.rerun()
 
     if 'summary_res' in st.session_state:

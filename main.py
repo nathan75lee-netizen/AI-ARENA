@@ -80,9 +80,9 @@ def sync_api_call(family, model_id, prompt):
                 if 'choices' in res:
                     tag = "" if current_model == model_id else f"\n\n*(자동우회: {current_model})*"
                     return res['choices'][0]['message']['content'] + tag
-            continue # 실패 시 다음 모델로
+            continue
         except Exception: continue
-    return f"⚠️ {family}: 모든 후보 모델 호출 실패 (할당량/잔액 부족)"
+    return f"⚠️ {family}: 모든 후보 모델 호출 실패"
 
 async def async_worker(index, family, model_id, prompt, placeholders):
     res = await asyncio.to_thread(sync_api_call, family, model_id, prompt)
@@ -98,7 +98,7 @@ def main():
     if 'res_list' not in st.session_state: st.session_state.res_list = [""] * num_models
     if 'last_in' not in st.session_state: st.session_state.last_in = [""] * num_models
 
-    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v2.9.1)</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v2.9.2)</h2>", unsafe_allow_html=True)
     
     with st.sidebar:
         st.write("### ⚙️ 모델 설정")
@@ -111,7 +111,12 @@ def main():
 
     main_q = st.text_area("Global Input", placeholder="고성능 모델부터 순차적으로 시도합니다...", label_visibility="collapsed", key="g_input", height=100)
     
+    # [수정] 메인 질문 실행 시 이전 종합 의견 초기화 로직 추가
     if st.button("🔍 모든 AI 답변 동시 시작", use_container_width=True) and main_q.strip():
+        # 이전 요약 결과 초기화
+        if 'summary_res' in st.session_state:
+            del st.session_state.summary_res
+        
         cols = st.columns(2)
         placeholders = [cols[i % 2].empty() for i in range(num_models)]
         loop = asyncio.new_event_loop()
@@ -131,14 +136,12 @@ def main():
                 st.session_state.res_list[i] = sync_api_call(fam, selected[fam], ind_q)
                 st.rerun()
 
-    # [중요] 전문가 답변 취합 및 교차 검증 기능 복구
     st.divider()
     if st.button("📝 모든 답변 교차 검증 및 전문가 요약", use_container_width=True):
         valid_ans = "".join([f"[{f_names[i]}]: {st.session_state.res_list[i]}\n\n" for i in range(num_models) if st.session_state.res_list[i] and "⚠️" not in st.session_state.res_list[i]])
         if valid_ans:
             with st.spinner("정보의 일관성을 정밀 분석 중..."):
                 v_prompt = f"다음은 여러 AI 전문가의 답변입니다. 핵심 공통점과 상충되는 지점을 구분하여 최종 결론을 도출해줘:\n\n{valid_ans}"
-                # 요약은 가장 신뢰도 높은 Claude 또는 GPT로 자동 시도
                 st.session_state.summary_res = sync_api_call("Claude", selected["Claude"], v_prompt)
                 st.rerun()
 

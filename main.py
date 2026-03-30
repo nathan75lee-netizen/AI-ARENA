@@ -4,7 +4,7 @@ import requests
 import asyncio
 import time
 
-# [v2.5.5 기반] 클라이언트 설정
+# [v2.5.5 엔진 기반] 클라이언트 설정
 @st.cache_resource
 def setup_clients():
     g_key = st.secrets.get("GEMINI_KEY")
@@ -23,24 +23,15 @@ def setup_clients():
 
 GEMINI_KEY, OR_KEY, GROQ_KEY, VALID_GEMINI = setup_clients()
 
-# [중요] 최신/고성능 모델부터 하위 모델까지의 우선순위 정의
+# 서비스별 우선순위 (고성능 -> 효율성 모델 순)
 PRIORITY_MAP = {
-    "Gemini": VALID_GEMINI, # 이미 최신순으로 정렬됨
-    "Groq": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768", "llama3-8b-8192"],
+    "Gemini": VALID_GEMINI,
+    "Groq": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
     "GPT": ["openai/gpt-4o", "openai/gpt-4o-mini"],
     "Claude": ["anthropic/claude-3.5-sonnet", "anthropic/claude-3-haiku"],
     "Llama": ["meta-llama/llama-3.3-70b-instruct", "meta-llama/llama-3.2-3b-instruct:free"],
-    "DeepSeek": ["deepseek/deepseek-chat", "deepseek/deepseek-r1:free"]
-}
-
-MODEL_CONFIG = {
-    "Gemini": VALID_GEMINI,
-    "Groq": PRIORITY_MAP["Groq"],
-    "GPT": PRIORITY_MAP["GPT"],
-    "Claude": PRIORITY_MAP["Claude"],
-    "Llama": PRIORITY_MAP["Llama"],
+    "DeepSeek": ["deepseek/deepseek-chat", "deepseek/deepseek-r1:free"],
     "Mistral": ["mistralai/pixtral-12b", "mistralai/mistral-nemo"],
-    "DeepSeek": PRIORITY_MAP["DeepSeek"],
     "Gemma": ["google/gemma-2-27b-it", "google/gemma-2-9b-it"]
 }
 
@@ -55,16 +46,15 @@ def apply_style():
         }
         .model-info { font-size: 11px; font-weight: 800; color: #1e40af; margin-bottom: 5px; display: block; }
         .stButton button { background-color: #3b82f6 !important; color: white !important; font-weight: bold !important; border-radius: 10px !important; height: 3.5rem; }
+        .summary-box { background: #f0fdf4; border: 2px solid #bbf7d0; border-radius: 15px; padding: 20px; margin-top: 20px; border-left: 10px solid #22c55e; }
         </style>
     """, unsafe_allow_html=True)
 
-# [핵심] 전 서비스 자동 모델 스위칭 엔진
+# [핵심] 전 모델 자동 우회 엔진 (v2.5.5 연결부 계승)
 def sync_api_call(family, model_id, prompt):
     if not prompt.strip(): return ""
     session = requests.Session()
-    
-    # 해당 패밀리의 전체 후보 리스트 (선택한 모델을 가장 먼저 시도)
-    candidates = [model_id] + [m for m in MODEL_CONFIG.get(family, []) if m != model_id]
+    candidates = [model_id] + [m for m in PRIORITY_MAP.get(family, []) if m != model_id]
     
     for current_model in candidates:
         try:
@@ -74,32 +64,25 @@ def sync_api_call(family, model_id, prompt):
                 if res and res.text:
                     tag = "" if current_model == model_id else f"\n\n*(자동우회: {current_model})*"
                     return res.text + tag
-            
             elif family == "Groq":
                 r = session.post("https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {GROQ_KEY}"},
                     json={"model": current_model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1024}, timeout=20)
-                res_json = r.json()
-                if 'choices' in res_json:
+                res = r.json()
+                if 'choices' in res:
                     tag = "" if current_model == model_id else f"\n\n*(자동우회: {current_model})*"
-                    return res_json['choices'][0]['message']['content'] + tag
-                if "429" in str(res_json): continue # 할당량 초과 시 다음 모델로
-
-            else: # OpenRouter 계열
+                    return res['choices'][0]['message']['content'] + tag
+            else: # OpenRouter
                 r = session.post("https://openrouter.ai/api/v1/chat/completions",
                     headers={"Authorization": f"Bearer {OR_KEY}", "HTTP-Referer": "http://localhost:8501"},
                     json={"model": current_model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 800}, timeout=30)
-                res_json = r.json()
-                if 'choices' in res_json:
+                res = r.json()
+                if 'choices' in res:
                     tag = "" if current_model == model_id else f"\n\n*(자동우회: {current_model})*"
-                    return res_json['choices'][0]['message']['content'] + tag
-                # 크레딧 부족이나 모델 장애 시 다음 모델 시도
-                continue 
-
-        except Exception:
-            continue # 에러 발생 시 즉시 다음 후보 모델 시도
-            
-    return f"⚠️ {family}: 모든 후보 모델 호출에 실패했습니다 (할당량/잔액 부족)."
+                    return res['choices'][0]['message']['content'] + tag
+            continue # 실패 시 다음 모델로
+        except Exception: continue
+    return f"⚠️ {family}: 모든 후보 모델 호출 실패 (할당량/잔액 부족)"
 
 async def async_worker(index, family, model_id, prompt, placeholders):
     res = await asyncio.to_thread(sync_api_call, family, model_id, prompt)
@@ -109,24 +92,24 @@ async def async_worker(index, family, model_id, prompt, placeholders):
 def main():
     st.set_page_config(page_title="AI Expert 8-Arena", layout="wide")
     apply_style()
-    f_names = list(MODEL_CONFIG.keys())
+    f_names = list(PRIORITY_MAP.keys())
     num_models = len(f_names)
 
     if 'res_list' not in st.session_state: st.session_state.res_list = [""] * num_models
     if 'last_in' not in st.session_state: st.session_state.last_in = [""] * num_models
 
-    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v2.9.0)</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v2.9.1)</h2>", unsafe_allow_html=True)
     
     with st.sidebar:
-        st.write("### ⚙️ 모델 설정 (최우선순위)")
-        selected = {fam: st.selectbox(f"{fam}", cfg, key=f"sel_{fam}") for fam, cfg in MODEL_CONFIG.items()}
+        st.write("### ⚙️ 모델 설정")
+        selected = {fam: st.selectbox(f"{fam}", cfg, key=f"sel_{fam}") for fam, cfg in PRIORITY_MAP.items()}
         st.divider()
         if any(st.session_state.res_list):
             report_text = "## AI Arena 분석 리포트\n\n"
             for i in range(num_models): report_text += f"#### {f_names[i]}\n{st.session_state.res_list[i]}\n\n"
-            st.download_button("📥 결과 다운로드", data=report_text, file_name="arena_report.md", use_container_width=True)
+            st.download_button("📥 결과 다운로드 (.md)", data=report_text, file_name="arena_report.md", use_container_width=True)
 
-    main_q = st.text_area("Global Input", placeholder="질문을 입력하면 고성능 모델부터 순차적으로 시도합니다...", label_visibility="collapsed", key="g_input", height=100)
+    main_q = st.text_area("Global Input", placeholder="고성능 모델부터 순차적으로 시도합니다...", label_visibility="collapsed", key="g_input", height=100)
     
     if st.button("🔍 모든 AI 답변 동시 시작", use_container_width=True) and main_q.strip():
         cols = st.columns(2)
@@ -147,6 +130,20 @@ def main():
                 st.session_state.last_in[i] = ind_q
                 st.session_state.res_list[i] = sync_api_call(fam, selected[fam], ind_q)
                 st.rerun()
+
+    # [중요] 전문가 답변 취합 및 교차 검증 기능 복구
+    st.divider()
+    if st.button("📝 모든 답변 교차 검증 및 전문가 요약", use_container_width=True):
+        valid_ans = "".join([f"[{f_names[i]}]: {st.session_state.res_list[i]}\n\n" for i in range(num_models) if st.session_state.res_list[i] and "⚠️" not in st.session_state.res_list[i]])
+        if valid_ans:
+            with st.spinner("정보의 일관성을 정밀 분석 중..."):
+                v_prompt = f"다음은 여러 AI 전문가의 답변입니다. 핵심 공통점과 상충되는 지점을 구분하여 최종 결론을 도출해줘:\n\n{valid_ans}"
+                # 요약은 가장 신뢰도 높은 Claude 또는 GPT로 자동 시도
+                st.session_state.summary_res = sync_api_call("Claude", selected["Claude"], v_prompt)
+                st.rerun()
+
+    if 'summary_res' in st.session_state:
+        st.markdown(f'<div class="summary-box"><h4>💡 종합 분석 리포트</h4>{st.session_state.summary_res}</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()

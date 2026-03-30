@@ -4,26 +4,40 @@ import requests
 import asyncio
 import time
 
-# [v3.2.0] 클라이언트 설정 (OpenRouter 무료 모델 위주)
+# [v3.4.0] 클라이언트 설정 (Gemini & Groq 전용)
 @st.cache_resource
 def setup_clients():
     g_key = st.secrets.get("GEMINI_KEY")
     gr_key = st.secrets.get("GROQ_KEY")
-    or_key = st.secrets.get("OR_KEY")
-    return g_key, gr_key, or_key
+    
+    # Gemini 모델 목록 초기화
+    valid_gemini = []
+    if g_key:
+        try:
+            genai.configure(api_key=g_key)
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    valid_gemini.append(m.name.replace("models/", ""))
+        except: pass
+    
+    # 목록이 비어있을 경우 기본값 강제 할당
+    if not valid_gemini:
+        valid_gemini = ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash"]
+        
+    return g_key, gr_key, valid_gemini
 
-GEMINI_KEY, GROQ_KEY, OR_KEY = setup_clients()
+GEMINI_KEY, GROQ_KEY, VALID_GEMINI = setup_clients()
 
-# [핵심] Gemini 할당량 초과 시 사용할 OpenRouter 무료 모델 라인업
+# [구성] 8개 슬롯 모델 배치 (Gemini 4개 / Groq 4개)
 PRIORITY_MAP = {
-    "Llama-Free-1": ["meta-llama/llama-3.2-3b-instruct:free"],
-    "Llama-Free-2": ["meta-llama/llama-3.1-8b-instruct:free"],
-    "Gemma-Free": ["google/gemma-2-9b-it:free"],
-    "Mistral-Free": ["mistralai/mistral-7b-instruct:free"],
-    "Phi-Free": ["microsoft/phi-3-medium-128k-instruct:free"],
-    "Groq-Llama": ["llama-3.3-70b-versatile"],
-    "Groq-Mixtral": ["mixtral-8x7b-32768"],
-    "Backup-Flash": ["gemini-1.5-flash"] # Gemini가 살아나면 작동
+    "1. Gemini-2.0-F": ["gemini-2.0-flash", "gemini-1.5-flash"],
+    "2. Gemini-1.5-P": ["gemini-1.5-pro", "gemini-2.0-flash"],
+    "3. Gemini-1.5-F": ["gemini-1.5-flash", "gemini-2.0-flash"],
+    "4. Gemini-Exp": ["gemini-1.5-pro", "gemini-1.5-flash"],
+    "5. Groq-Llama-70B": ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile"],
+    "6. Groq-Llama-8B": ["llama-3.1-8b-instant", "llama-3.2-3b-preview"],
+    "7. Groq-Mixtral": ["mixtral-8x7b-32768"],
+    "8. Groq-Backup": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"]
 }
 
 def apply_style():
@@ -37,40 +51,44 @@ def apply_style():
         }
         .model-info { font-size: 11px; font-weight: 800; color: #1e40af; margin-bottom: 5px; display: block; }
         .stButton button { background-color: #3b82f6 !important; color: white !important; font-weight: bold !important; border-radius: 10px !important; height: 3.5rem; }
+        .summary-box { background: #f0fdf4; border: 2px solid #bbf7d0; border-radius: 15px; padding: 20px; margin-top: 20px; border-left: 10px solid #22c55e; }
         </style>
     """, unsafe_allow_html=True)
 
 def sync_api_call(family, model_id, prompt):
     if not prompt.strip(): return ""
-    session = requests.Session()
     
-    try:
-        # 1. Groq 호출 (슬롯 6, 7)
-        if "Groq" in family:
-            r = session.post("https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                json={"model": model_id, "messages": [{"role": "user", "content": prompt}]}, timeout=20)
-            if r.status_code == 200: return r.json()['choices'][0]['message']['content']
-        
-        # 2. OpenRouter 무료 모델 호출 (슬롯 1, 2, 3, 4, 5)
-        elif ":free" in model_id:
-            r = session.post("https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OR_KEY}", "HTTP-Referer": "https://streamlit.io"},
-                json={"model": model_id, "messages": [{"role": "user", "content": prompt}]}, timeout=40)
-            if r.status_code == 200: return r.json()['choices'][0]['message']['content']
-            else: return f"⚠️ OpenRouter 에러: {r.status_code} (인증 확인 필요)"
-
-        # 3. Gemini 호출 (슬롯 8)
-        else:
-            genai.configure(api_key=GEMINI_KEY)
-            model = genai.GenerativeModel(model_name=model_id)
-            res = model.generate_content(prompt)
-            return res.text
-    except Exception as e:
-        return f"⚠️ 호출 실패: {str(e)}"
+    # 후보 모델 리스트 (현재 모델 실패 시 자동 우회용)
+    candidates = [model_id] + [m for m in PRIORITY_MAP.get(family, []) if m != model_id]
+    
+    for current_model in candidates:
+        try:
+            # Gemini 호출부
+            if "Gemini" in family:
+                genai.configure(api_key=GEMINI_KEY)
+                model = genai.GenerativeModel(model_name=current_model)
+                res = model.generate_content(prompt)
+                if res and res.text:
+                    tag = "" if current_model == model_id else f"\n\n*(우회: {current_model})*"
+                    return res.text + tag
+            
+            # Groq 호출부
+            else:
+                r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                    json={"model": current_model, "messages": [{"role": "user", "content": prompt}]}, timeout=25)
+                if r.status_code == 200:
+                    tag = "" if current_model == model_id else f"\n\n*(우회: {current_model})*"
+                    return r.json()['choices'][0]['message']['content'] + tag
+                elif r.status_code == 429: # 속도 제한 시 다음 모델로
+                    continue
+        except:
+            continue
+    return f"⚠️ {family}: 호출 실패 (쿼터 초과)"
 
 async def async_worker(index, family, model_id, prompt, placeholders):
-    await asyncio.sleep(index * 1.5) # 호출 간격 더 늘림 (안전성 최우선)
+    # 호출 간 미세 시차 (index 0~7 순차적 지연)
+    await asyncio.sleep(index * 1.2)
     res = await asyncio.to_thread(sync_api_call, family, model_id, prompt)
     st.session_state.res_list[index] = res
     placeholders[index].markdown(f'''<div class="res-card"><span class="model-info">{index+1}. {family} • {model_id}</span>{res}</div>''', unsafe_allow_html=True)
@@ -83,15 +101,16 @@ def main():
 
     if 'res_list' not in st.session_state: st.session_state.res_list = [""] * num_models
 
-    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v3.2.0)</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v3.4.0)</h2>", unsafe_allow_html=True)
     
     with st.sidebar:
-        st.write("### ⚙️ 모델 설정")
+        st.write("### ⚙️ 모델 설정 (Gemini/Groq)")
         selected = {fam: st.selectbox(f"{fam}", cfg, key=f"sel_{fam}") for fam, cfg in PRIORITY_MAP.items()}
 
-    main_q = st.text_area("Global Input", placeholder="Gemini 할당량 초과 시 OpenRouter 무료 모델로 대체 분석합니다...", label_visibility="collapsed", key="g_input", height=100)
+    main_q = st.text_area("Global Input", placeholder="Gemini와 Groq API만 사용하여 분석합니다...", label_visibility="collapsed", key="g_input", height=100)
     
-    if st.button("🔍 모든 AI 답변 동시 시작", use_container_width=True) and main_q.strip():
+    if st.button("🔍 8개 모델 동시 분석 시작", use_container_width=True) and main_q.strip():
+        if 'summary_res' in st.session_state: del st.session_state.summary_res
         cols = st.columns(2)
         placeholders = [cols[i % 2].empty() for i in range(num_models)]
         loop = asyncio.new_event_loop()
@@ -105,6 +124,15 @@ def main():
         fam = f_names[i]
         with cols[i % 2]:
             st.markdown(f'''<div class="res-card"><span class="model-info">{i+1}. {fam} • {selected[fam]}</span>{st.session_state.res_list[i] if st.session_state.res_list[i] else "..."}</div>''', unsafe_allow_html=True)
+
+    if any(st.session_state.res_list) and st.button("📝 전문가 요약", use_container_width=True):
+        valid_ans = "".join([f"[{f_names[i]}]: {st.session_state.res_list[i]}\n\n" for i in range(num_models) if st.session_state.res_list[i] and "⚠️" not in st.session_state.res_list[i]])
+        if valid_ans:
+            st.session_state.summary_res = sync_api_call("Gemini-Flash", "gemini-1.5-flash", f"요약해줘:\n\n{valid_ans}")
+            st.rerun()
+
+    if 'summary_res' in st.session_state:
+        st.markdown(f'<div class="summary-box"><h4>💡 종합 분석 리포트</h4>{st.session_state.summary_res}</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()

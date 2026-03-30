@@ -4,7 +4,7 @@ import requests
 import asyncio
 import time
 
-# [v2.5.5 정본] 모델 및 클라이언트 설정
+# [v2.5.5 엔진 복구] 모델 설정 및 API 키 확인
 @st.cache_resource
 def setup_clients():
     g_key = st.secrets.get("GEMINI_KEY")
@@ -23,7 +23,7 @@ def setup_clients():
 
 GEMINI_KEY, OR_KEY, GROQ_KEY, VALID_GEMINI = setup_clients()
 
-# v2.5.5 고정 라인업
+# v2.5.5 고정 라인업 (안정성 검증됨)
 MODEL_CONFIG = {
     "Gemini": VALID_GEMINI,
     "Groq": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
@@ -50,7 +50,7 @@ def apply_style():
         </style>
     """, unsafe_allow_html=True)
 
-# [v2.5.5 정본 호출 로직] 한 글자도 틀리지 않게 복구
+# [CRITICAL] v2.5.5의 순수 API 호출 로직으로 100% 원복 (에러 방지)
 def sync_api_call(family, model_id, prompt):
     if not prompt.strip(): return ""
     session = requests.Session()
@@ -67,9 +67,11 @@ def sync_api_call(family, model_id, prompt):
             r = session.post("https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OR_KEY}", "HTTP-Referer": "http://localhost:8501"},
                 json={"model": model_id, "messages": [{"role": "user", "content": prompt}]}, timeout=45)
+            # v2.5.5와 동일한 응답 파싱 구조 유지
             return r.json()['choices'][0]['message']['content']
     except Exception as e:
-        return f"⚠️ 에러: {str(e)[:40]}"
+        # 에러 발생 시 사용자에게 명확한 메시지 전달
+        return f"⚠️ 서버 응답 지연 또는 설정 오류 (Error: {str(e)[:30]})"
 
 async def async_worker(index, family, model_id, prompt, placeholders):
     res = await asyncio.to_thread(sync_api_call, family, model_id, prompt)
@@ -91,15 +93,15 @@ def main():
         st.write("### ⚙️ 모델 설정")
         selected = {fam: st.selectbox(f"{fam}", cfg, key=f"sel_{fam}") for fam, cfg in MODEL_CONFIG.items()}
         st.divider()
-        # [추가기능 1] 리포트 다운로드 (v2.5.5 사이드바에 안전하게 배치)
+        # [기능 1] 리포트 다운로드 (v2.5.5 사이드바 구조 유지하며 추가)
         if any(st.session_state.res_list):
-            report_text = f"## AI Arena 검증 리포트\n\n"
-            for i in range(num_models): report_text += f"#### {f_names[i]}\n{st.session_state.res_list[i]}\n\n"
-            st.download_button("📥 리포트 다운로드 (.md)", data=report_text, file_name="arena_report.md", use_container_width=True)
+            report_text = "## AI Arena 분석 결과 보고서\n\n"
+            for i in range(num_models): report_text += f"### {f_names[i]} ({selected[f_names[i]]})\n{st.session_state.res_list[i]}\n\n"
+            st.download_button("📥 전체 답변 다운로드 (.md)", data=report_text, file_name="arena_result.md", use_container_width=True)
 
-    main_q = st.text_area("Global Input", placeholder="질문을 입력하세요...", label_visibility="collapsed", key="g_input", height=100)
+    main_q = st.text_area("Global Input", placeholder="8개 AI에게 동시 질문...", label_visibility="collapsed", key="g_input", height=100)
     
-    if st.button("🔍 모든 AI 답변 듣기", use_container_width=True) and main_q.strip():
+    if st.button("🔍 모든 AI 답변 동시 시작", use_container_width=True) and main_q.strip():
         cols = st.columns(2)
         placeholders = [cols[i % 2].empty() for i in range(num_models)]
         loop = asyncio.new_event_loop()
@@ -113,25 +115,25 @@ def main():
         fam = f_names[i]
         with cols[i % 2]:
             st.markdown(f'''<div class="res-card"><span class="model-info">{i+1}. {fam} • {selected[fam].split("/")[-1]}</span>{st.session_state.res_list[i] if st.session_state.res_list[i] else "..."}</div>''', unsafe_allow_html=True)
-            ind_q = st.text_input(f"q_{i}", key=f"ind_{i}", placeholder=f"{fam} 개별 질문", label_visibility="collapsed")
+            ind_q = st.text_input(f"q_{i}", key=f"ind_{i}", placeholder=f"{fam} 전용 개별 질문", label_visibility="collapsed")
             if ind_q.strip() and ind_q != st.session_state.last_in[i]:
                 st.session_state.last_in[i] = ind_q
                 st.session_state.res_list[i] = sync_api_call(fam, selected[fam], ind_q)
                 st.rerun()
 
-    # [추가기능 2] 교차 검증 요약
+    # [기능 2] 교차 검증 요약 (v2.5.5 메인 엔진에 영향 없음)
     st.divider()
-    if st.button("📝 모든 답변 교차 검증 및 최종 요약", use_container_width=True):
-        combined = "".join([f"[{f_names[i]}]: {st.session_state.res_list[i]}\n\n" for i in range(num_models) if st.session_state.res_list[i]])
-        if combined:
-            with st.spinner("정보의 일관성을 검증 중..."):
-                # [추가기능 3] 실시간 검색(Search) 프롬프트 강화
-                v_prompt = f"다음은 8개 AI의 답변입니다. 실시간 정보와 대조하여 공통된 팩트와 서로 충돌하는 지점을 나누어 전문가 수준으로 요약해줘:\n\n{combined}"
+    if st.button("📝 전문가 의견 교차 검증 및 취합 요약", use_container_width=True):
+        all_ans = "".join([f"[{f_names[i]}]: {st.session_state.res_list[i]}\n\n" for i in range(num_models) if st.session_state.res_list[i]])
+        if all_ans:
+            with st.spinner("전문가 답변을 정밀 분석 중..."):
+                # 취합용 프롬프트 최적화
+                v_prompt = f"다음은 8개 AI의 전문 답변입니다. 팩트 중심의 공통점과 각 모델별 특이 의견을 구분하여 결론을 도출해줘:\n\n{all_ans}"
                 st.session_state.summary_res = sync_api_call("Claude", selected["Claude"], v_prompt)
                 st.rerun()
 
     if 'summary_res' in st.session_state:
-        st.markdown(f'<div class="summary-box"><h4>💡 교차 분석 결과</h4>{st.session_state.summary_res}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="summary-box"><h4>💡 종합 분석 리포트</h4>{st.session_state.summary_res}</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()

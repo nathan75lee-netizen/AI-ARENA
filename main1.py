@@ -18,100 +18,96 @@ def get_key(name):
 G_KEY = get_key("GEMINI_KEY")
 Q_KEY = get_key("GROQ_KEY")
 
-def scan_available_models():
-    """서버에서 현재 권한이 있는 모델 리스트를 실시간으로 가져옴"""
+def scan_models():
     models = {"G": [], "Q": []}
     if G_KEY:
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models?key={G_KEY}"
-            r = requests.get(url, timeout=10)
+            r = requests.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={G_KEY}", timeout=10)
             if r.status_code == 200:
                 models["G"] = [m['name'] for m in r.json().get('models', []) if 'generateContent' in m.get('supportedGenerationMethods', []) and "vision" not in m['name']]
         except: pass
     if Q_KEY:
         try:
-            url = "https://api.groq.com/openai/v1/models"
-            r = requests.get(url, headers={"Authorization": f"Bearer {Q_KEY}"}, timeout=10)
+            r = requests.get("https://api.groq.com/openai/v1/models", headers={"Authorization": f"Bearer {Q_KEY}"}, timeout=10)
             if r.status_code == 200:
                 models["Q"] = [m['id'] for m in r.json().get('data', [])]
         except: pass
     return models
 
-def call_with_retry(engine, m_id, prompt, role, max_retries=3):
-    """429 에러 발생 시 자동으로 대기 후 재시도하는 핵심 로직"""
+def call_with_relay(engine, m_list, prompt, role):
+    """지정된 엔진의 모델 리스트를 순회하며 성공할 때까지 릴레이 호출"""
     headers = {"Content-Type": "application/json"}
-    for i in range(max_retries):
+    
+    # 모델 리스트가 비어있으면 종료
+    if not m_list: return None, "No models available"
+
+    for idx, m_id in enumerate(m_list[:5]): # 상위 5개 모델만 릴레이 시도
         try:
             if engine == "G":
-                # 스캔된 전체 경로(models/...)를 그대로 사용
                 url = f"https://generativelanguage.googleapis.com/v1beta/{m_id}:generateContent?key={G_KEY}"
                 payload = {"contents": [{"parts": [{"text": f"당신은 {role}입니다. 질문: {prompt}"}]}]}
-                r = requests.post(url, json=payload, timeout=30)
+                r = requests.post(url, json=payload, timeout=25)
             else:
                 url = "https://api.groq.com/openai/v1/chat/completions"
                 headers["Authorization"] = f"Bearer {Q_KEY}"
-                payload = {
-                    "model": m_id,
-                    "messages": [{"role": "user", "content": f"지시: {role}로서 답변하라.\n질문: {prompt}"}]
-                }
-                r = requests.post(url, json=payload, headers=headers, timeout=30)
+                payload = {"model": m_id, "messages": [{"role": "user", "content": f"지시: {role}로서 답변하라. 질문: {prompt}"}]}
+                r = requests.post(url, json=payload, headers=headers, timeout=25)
 
             if r.status_code == 200:
-                if engine == "G": return r.json()['candidates'][0]['content']['parts'][0]['text'], "Success"
-                return r.json()['choices'][0]['message']['content'], "Success"
+                if engine == "G": return r.json()['candidates'][0]['content']['parts'][0]['text'], f"Success ({m_id})"
+                return r.json()['choices'][0]['message']['content'], f"Success ({m_id})"
             
-            # 429(Rate Limit) 발생 시 지수 백오프 대기
+            # 429 에러 발생 시 다음 모델로 즉시 바통 터치
             if r.status_code == 429:
-                wait_time = (i + 1) * 10 # 10초, 20초, 30초 점진적 대기
-                st.warning(f"⚠️ {role}({engine}) 한도 초과(429). {wait_time}초 후 재시도합니다... ({i+1}/{max_retries})")
-                time.sleep(wait_time)
+                st.warning(f"⚠️ {role}({m_id}) 할당량 초과. 다음 가용 모델로 릴레이합니다...")
+                time.sleep(3)
                 continue
             
-            return None, f"Status {r.status_code}: {r.text[:50]}"
-        except Exception as e:
-            time.sleep(2)
-            if i == max_retries - 1: return None, str(e)
-    return None, "재시도 횟수 초과"
+            return None, f"Status {r.status_code}"
+        except:
+            continue
+            
+    return None, "모든 릴레이 모델 호출 실패"
 
 # --- UI ---
-st.set_page_config(page_title="Arena v24.5", layout="wide")
-st.title("🏛️ 아레나 v24.5 (자동 모델 스캔 & 재시도)")
+st.set_page_config(page_title="Arena v25.0", layout="wide")
+st.title("🏛️ 아레나 v25.0 (모델 릴레이 시스템)")
 
-if 'models' not in st.session_state:
-    st.session_state.models = {"G": [], "Q": []}
+if 'pool' not in st.session_state:
+    st.session_state.pool = {"G": [], "Q": []}
 
 with st.sidebar:
     if st.button("🔍 가용 모델 실시간 스캔", type="primary"):
-        st.session_state.models = scan_available_models()
-        st.success("스캔 완료!")
-    
-    st.write(f"Gemini: {len(st.session_state.models['G'])}개 | Groq: {len(st.session_state.models['Q'])}개")
+        st.session_state.pool = scan_models()
+        st.success(f"G:{len(st.session_state.pool['G'])} / Q:{len(st.session_state.pool['Q'])} 스캔됨")
 
 topic = st.text_input("토론 주제 입력")
 
 if st.button("🚀 아레나 가동") and topic:
-    m = st.session_state.models
-    if not m["G"] and not m["Q"]:
-        st.error("사이드바에서 [모델 스캔]을 먼저 실행하세요.")
+    p = st.session_state.pool
+    if not p["G"] and not p["Q"]:
+        st.error("먼저 스캔 버튼을 눌러주세요.")
         st.stop()
 
-    # 유동적 모델 배정 (가장 앞순위 모델들 선택)
-    experts = []
-    if m["G"]: experts.append((m["G"][0], "G", "전략가"))
-    if m["Q"]: experts.append((m["Q"][0], "Q", "기술자"))
-    if len(m["Q"]) > 1: experts.append((m["Q"][1], "Q", "리스크"))
-    elif len(m["G"]) > 1: experts.append((m["G"][1], "G", "리스크"))
+    # 역할별 릴레이 그룹 설정
+    # 전략가: Gemini 그룹 / 기술자: Groq 그룹 / 리스크: Groq 또는 Gemini 남은 그룹
+    experts = [
+        ("G", p["G"], "전략가"),
+        ("Q", p["Q"], "기술자"),
+        ("Q", p["Q"][1:] if len(p["Q"]) > 1 else p["G"][1:], "리스크")
+    ]
 
-    cols = st.columns(len(experts))
+    cols = st.columns(3)
     logs = []
 
-    for i, (mid, eng, role) in enumerate(experts):
+    for i, (eng, m_list, role) in enumerate(experts):
         with cols[i]:
-            with st.spinner(f"{role} 호출 중..."):
-                time.sleep(2) # 기본 간격
-                ans, status = call_with_retry(eng, mid, topic, role)
+            with st.spinner(f"{role} 소환 중..."):
+                time.sleep(2)
+                ans, status = call_with_relay(eng, m_list, topic, role)
                 if ans:
-                    st.success(f"**{role}** 입정\n({mid})")
+                    st.success(f"**{role}** 입정")
+                    st.caption(status)
                     st.write(ans)
                     logs.append(ans)
                 else:
@@ -120,8 +116,7 @@ if st.button("🚀 아레나 가동") and topic:
 
     if logs:
         st.divider()
-        st.subheader("📝 종합 결론")
-        # 요약은 첫 번째 전문가가 수행
-        final_mid, final_eng, _ = experts[0]
-        final_ans, _ = call_with_retry(final_eng, final_mid, f"다음 요약: {' '.join(logs)}", "서기")
-        st.write(final_ans if final_ans else "리포트 작성 실패")
+        st.subheader("📝 최종 리포트")
+        # 요약은 가장 안정적인 첫번째 전문가 엔진 사용
+        f_ans, _ = call_with_relay(experts[0][0], experts[0][1], f"요약하라: {' '.join(logs)}", "서기")
+        st.markdown(f_ans if f_ans else "리포트 생성 실패")

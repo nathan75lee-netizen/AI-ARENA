@@ -4,7 +4,7 @@ import requests
 import asyncio
 import time
 
-# [v2.5.5 엔진 기반] 클라이언트 설정
+# [v2.5.5 엔진 기반] 클라이언트 설정 및 안정화
 @st.cache_resource
 def setup_clients():
     g_key = st.secrets.get("GEMINI_KEY")
@@ -18,7 +18,6 @@ def setup_clients():
                 if 'generateContent' in m.supported_generation_methods:
                     valid_gemini.append(m.name.replace("models/", ""))
         except: pass
-    # Gemini 모델이 하나도 안 잡힐 경우를 대비한 기본값
     if not valid_gemini: valid_gemini = ["gemini-1.5-flash", "gemini-1.5-pro"]
     return g_key, or_key, gr_key, valid_gemini
 
@@ -50,50 +49,49 @@ def apply_style():
         </style>
     """, unsafe_allow_html=True)
 
-# [핵심] 429 에러 및 Credits 부족 에러를 방어하는 정교한 연결부
+# [핵심 수리] API 호출 엔진 - v2.5.5 로직 복구 및 에러 핸들링 강화
 def sync_api_call(family, model_id, prompt):
     if not prompt.strip(): return ""
     session = requests.Session()
     try:
         if family == "Gemini":
-            # 429 에러 발생 시 최대 2번 재시도 (간격 5초)
-            for i in range(2):
+            # 429(할당량 초과) 발생 시 짧게 대기 후 재시도 로직
+            for _ in range(2): 
                 try:
                     model = genai.GenerativeModel(model_name=model_id.split('/')[-1])
-                    return model.generate_content(prompt).text
-                except Exception as ge:
-                    if "429" in str(ge):
-                        time.sleep(5) # 할당량 회복을 위한 대기
+                    res = model.generate_content(prompt)
+                    return res.text if res else "⚠️ 응답 값이 비어있습니다 (None)."
+                except Exception as e:
+                    if "429" in str(e):
+                        time.sleep(2)
                         continue
-                    raise ge
+                    return f"⚠️ Gemini 에러: {str(e)[:50]}"
         
         elif family == "Groq":
             r = session.post("https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                json={"model": model_id, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1024}, timeout=20)
-            res = r.json()
-            return res['choices'][0]['message']['content'] if 'choices' in res else f"⚠️ Groq: {res.get('error', {}).get('message', 'Error')}"
+                json={"model": model_id, "messages": [{"role": "user", "content": prompt}]}, timeout=20)
+            res_json = r.json()
+            if 'choices' in res_json: return res_json['choices'][0]['message']['content']
+            return f"⚠️ Groq: {res_json.get('error', {}).get('message', 'API Error')}"
             
         else: # OpenRouter 계열 (GPT, Claude 등)
+            # [수정] max_tokens를 명시하여 잔액 부족 에러를 방지함
             r = session.post("https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OR_KEY}", "HTTP-Referer": "http://localhost:8501"},
                 json={
                     "model": model_id, 
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 800 # 잔액 부족 방지를 위해 토큰 요청값 하향 조정
+                    "max_tokens": 1000 
                 }, timeout=45)
-            res = r.json()
-            # [수정] 응답 객체에 choices가 없을 경우의 처리 강화
-            if 'choices' in res:
-                return res['choices'][0]['message']['content']
-            else:
-                err_msg = res.get('error', {}).get('message', 'Unknown Error')
-                if "credits" in err_msg.lower():
-                    return "⚠️ 크레딧 부족: OpenRouter 잔액을 확인하거나 무료(:free) 모델을 사용하세요."
-                return f"⚠️ API 에러: {err_msg}"
+            res_json = r.json()
+            if 'choices' in res_json: return res_json['choices'][0]['message']['content']
+            # 잔액 부족이나 모델 에러 시 메시지 출력
+            err_msg = res_json.get('error', {}).get('message', 'Unknown Error')
+            return f"⚠️ API 에러: {err_msg}"
             
     except Exception as e:
-        return f"⚠️ 연결 지연: 인터넷 상태나 API 키를 확인하세요."
+        return f"⚠️ 연결 실패: {str(e)[:40]}"
 
 async def async_worker(index, family, model_id, prompt, placeholders):
     res = await asyncio.to_thread(sync_api_call, family, model_id, prompt)
@@ -116,11 +114,11 @@ def main():
         selected = {fam: st.selectbox(f"{fam}", cfg, key=f"sel_{fam}") for fam, cfg in MODEL_CONFIG.items()}
         st.divider()
         if any(st.session_state.res_list):
-            report_text = "## AI Arena 분석 리포트\n\n"
-            for i in range(num_models): report_text += f"### {f_names[i]}\n{st.session_state.res_list[i]}\n\n"
-            st.download_button("📥 결과 다운로드 (.md)", data=report_text, file_name="arena_report.md", use_container_width=True)
+            report_text = "## AI Arena 분석 결과 리포트\n\n"
+            for i in range(num_models): report_text += f"#### {f_names[i]}\n{st.session_state.res_list[i]}\n\n"
+            st.download_button("📥 리포트 다운로드 (.md)", data=report_text, file_name="arena_report.md", use_container_width=True)
 
-    main_q = st.text_area("Global Input", placeholder="여기에 질문을 입력하면 8개 AI가 동시에 답합니다.", label_visibility="collapsed", key="g_input", height=100)
+    main_q = st.text_area("Global Input", placeholder="질문을 입력하세요...", label_visibility="collapsed", key="g_input", height=100)
     
     if st.button("🔍 모든 AI 답변 동시 시작", use_container_width=True) and main_q.strip():
         cols = st.columns(2)
@@ -142,18 +140,18 @@ def main():
                 st.session_state.res_list[i] = sync_api_call(fam, selected[fam], ind_q)
                 st.rerun()
 
-    # 교차 검증 요약 (v2.5.5 구조에 완전 통합)
+    # 교차 검증 및 취합 기능 (출력단에만 추가됨)
     st.divider()
-    if st.button("📝 모든 답변 교차 검증 및 취합 요약", use_container_width=True):
-        valid_ans = [f"[{f_names[i]}]: {st.session_state.res_list[i]}" for i in range(num_models) if st.session_state.res_list[i] and "⚠️" not in st.session_state.res_list[i]]
-        if valid_ans:
-            with st.spinner("정보의 일관성을 분석 중..."):
-                v_prompt = f"다음은 여러 전문가 AI의 답변들입니다. 팩트 중심의 공통점과 상충되는 지점을 정리하고 최종 결론을 도출해줘:\n\n" + "\n\n".join(valid_ans)
+    if st.button("📝 전문가 답변 교차 검증 및 최종 요약", use_container_width=True):
+        all_text = "".join([f"[{f_names[i]}]: {st.session_state.res_list[i]}\n\n" for i in range(num_models) if st.session_state.res_list[i] and "⚠️" not in st.session_state.res_list[i]])
+        if all_text:
+            with st.spinner("정보의 일관성을 검증하는 중..."):
+                v_prompt = f"다음은 8개 AI의 답변입니다. 공통된 사실과 서로 다른 의견을 대조하여 전문가적인 결론을 도출해줘:\n\n{all_text}"
                 st.session_state.summary_res = sync_api_call("Claude", selected["Claude"], v_prompt)
                 st.rerun()
 
     if 'summary_res' in st.session_state:
-        st.markdown(f'<div class="summary-box"><h4>💡 교차 검증 요약 리포트</h4>{st.session_state.summary_res}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="summary-box"><h4>💡 교차 검증 리포트</h4>{st.session_state.summary_res}</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()

@@ -4,7 +4,7 @@ import requests
 import asyncio
 import time
 
-# [v2.5.5 연결부 완전 복구] 모델 리스트 및 설정 유지
+# [v2.5.5 정본] 모델 및 클라이언트 설정
 @st.cache_resource
 def setup_clients():
     g_key = st.secrets.get("GEMINI_KEY")
@@ -23,7 +23,7 @@ def setup_clients():
 
 GEMINI_KEY, OR_KEY, GROQ_KEY, VALID_GEMINI = setup_clients()
 
-# v2.5.5에서 잘 작동하던 모델 라인업 그대로 고정
+# v2.5.5 고정 라인업
 MODEL_CONFIG = {
     "Gemini": VALID_GEMINI,
     "Groq": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
@@ -44,24 +44,19 @@ def apply_style():
             padding: 16px; margin-bottom: 5px; min-height: 120px; max-height: 400px; 
             overflow-y: auto; font-size: 14px; border-left: 6px solid #3b82f6;
         }
-        .summary-box {
-            background: #f0fdf4; border: 2px solid #bbf7d0; border-radius: 15px;
-            padding: 20px; margin-top: 20px; border-left: 10px solid #22c55e;
-        }
         .model-info { font-size: 11px; font-weight: 800; color: #1e40af; margin-bottom: 5px; display: block; }
         .stButton button { background-color: #3b82f6 !important; color: white !important; font-weight: bold !important; border-radius: 10px !important; height: 3.5rem; }
+        .summary-box { background: #f0fdf4; border: 2px solid #bbf7d0; border-radius: 15px; padding: 20px; margin-top: 20px; border-left: 10px solid #22c55e; }
         </style>
     """, unsafe_allow_html=True)
 
-# [v2.5.5 방식] API 호출 함수 (검색 옵션만 안전하게 추가)
-def sync_api_call(family, model_id, prompt, use_search=False):
+# [v2.5.5 정본 호출 로직] 한 글자도 틀리지 않게 복구
+def sync_api_call(family, model_id, prompt):
     if not prompt.strip(): return ""
     session = requests.Session()
     try:
         if family == "Gemini":
-            # Gemini 실시간 검색 도구 (API 지원 시에만 작동하도록 안전 장치)
-            tools = [{"google_search_retrieval": {}}] if use_search else None
-            model = genai.GenerativeModel(model_name=model_id.split('/')[-1], tools=tools)
+            model = genai.GenerativeModel(model_name=model_id.split('/')[-1])
             return model.generate_content(prompt).text
         elif family == "Groq":
             r = session.post("https://api.groq.com/openai/v1/chat/completions",
@@ -76,13 +71,13 @@ def sync_api_call(family, model_id, prompt, use_search=False):
     except Exception as e:
         return f"⚠️ 에러: {str(e)[:40]}"
 
-async def async_worker(index, family, model_id, prompt, placeholders, use_search=False):
-    res = await asyncio.to_thread(sync_api_call, family, model_id, prompt, use_search)
+async def async_worker(index, family, model_id, prompt, placeholders):
+    res = await asyncio.to_thread(sync_api_call, family, model_id, prompt)
     st.session_state.res_list[index] = res
     placeholders[index].markdown(f'''<div class="res-card"><span class="model-info">{index+1}. {family} • {model_id.split("/")[-1]}</span>{res}</div>''', unsafe_allow_html=True)
 
 def main():
-    st.set_page_config(page_title="AI Arena 8", layout="wide")
+    st.set_page_config(page_title="AI Expert 8-Arena", layout="wide")
     apply_style()
     f_names = list(MODEL_CONFIG.keys())
     num_models = len(f_names)
@@ -93,14 +88,12 @@ def main():
     st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena</h2>", unsafe_allow_html=True)
     
     with st.sidebar:
-        st.write("### ⚙️ 설정 및 도구")
-        use_search = st.checkbox("🔍 Gemini 실시간 검색 활성화", value=False)
+        st.write("### ⚙️ 모델 설정")
         selected = {fam: st.selectbox(f"{fam}", cfg, key=f"sel_{fam}") for fam, cfg in MODEL_CONFIG.items()}
         st.divider()
-        # [추가] 리포트 다운로드
+        # [추가기능 1] 리포트 다운로드 (v2.5.5 사이드바에 안전하게 배치)
         if any(st.session_state.res_list):
             report_text = f"## AI Arena 검증 리포트\n\n"
-            if 'summary_res' in st.session_state: report_text += f"### 종합 분석\n{st.session_state.summary_res}\n\n"
             for i in range(num_models): report_text += f"#### {f_names[i]}\n{st.session_state.res_list[i]}\n\n"
             st.download_button("📥 리포트 다운로드 (.md)", data=report_text, file_name="arena_report.md", use_container_width=True)
 
@@ -111,7 +104,7 @@ def main():
         placeholders = [cols[i % 2].empty() for i in range(num_models)]
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(asyncio.gather(*(async_worker(i, f_names[i], selected[f_names[i]], main_q, placeholders, use_search if f_names[i]=="Gemini" else False) for i in range(num_models))))
+        loop.run_until_complete(asyncio.gather(*(async_worker(i, f_names[i], selected[f_names[i]], main_q, placeholders) for i in range(num_models))))
         st.rerun()
 
     st.divider()
@@ -123,16 +116,17 @@ def main():
             ind_q = st.text_input(f"q_{i}", key=f"ind_{i}", placeholder=f"{fam} 개별 질문", label_visibility="collapsed")
             if ind_q.strip() and ind_q != st.session_state.last_in[i]:
                 st.session_state.last_in[i] = ind_q
-                st.session_state.res_list[i] = sync_api_call(fam, selected[fam], ind_q, use_search if fam=="Gemini" else False)
+                st.session_state.res_list[i] = sync_api_call(fam, selected[fam], ind_q)
                 st.rerun()
 
-    # [추가] 교차 검증 요약 기능
+    # [추가기능 2] 교차 검증 요약
     st.divider()
     if st.button("📝 모든 답변 교차 검증 및 최종 요약", use_container_width=True):
         combined = "".join([f"[{f_names[i]}]: {st.session_state.res_list[i]}\n\n" for i in range(num_models) if st.session_state.res_list[i]])
         if combined:
             with st.spinner("정보의 일관성을 검증 중..."):
-                v_prompt = f"다음 8개 AI 답변을 대조하여, 공통된 팩트와 서로 충돌하는 지점을 나누어 전문가 수준으로 요약해줘:\n\n{combined}"
+                # [추가기능 3] 실시간 검색(Search) 프롬프트 강화
+                v_prompt = f"다음은 8개 AI의 답변입니다. 실시간 정보와 대조하여 공통된 팩트와 서로 충돌하는 지점을 나누어 전문가 수준으로 요약해줘:\n\n{combined}"
                 st.session_state.summary_res = sync_api_call("Claude", selected["Claude"], v_prompt)
                 st.rerun()
 

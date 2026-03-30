@@ -4,33 +4,26 @@ import requests
 import asyncio
 import time
 
-# [v3.1.0] 클라이언트 및 쿼터 관리 설정
+# [v3.2.0] 클라이언트 설정 (OpenRouter 무료 모델 위주)
 @st.cache_resource
 def setup_clients():
     g_key = st.secrets.get("GEMINI_KEY")
     gr_key = st.secrets.get("GROQ_KEY")
-    valid_gemini = []
-    if g_key:
-        try:
-            genai.configure(api_key=g_key)
-            for m in genai.list_models():
-                if 'generateContent' in m.supported_generation_methods:
-                    valid_gemini.append(m.name.replace("models/", ""))
-        except: pass
-    if not valid_gemini: valid_gemini = ["gemini-2.0-flash", "gemini-1.5-flash"]
-    return g_key, gr_key, valid_gemini
+    or_key = st.secrets.get("OR_KEY")
+    return g_key, gr_key, or_key
 
-GEMINI_KEY, GROQ_KEY, VALID_GEMINI = setup_clients()
+GEMINI_KEY, GROQ_KEY, OR_KEY = setup_clients()
 
+# [핵심] Gemini 할당량 초과 시 사용할 OpenRouter 무료 모델 라인업
 PRIORITY_MAP = {
-    "Gemini-Pro": ["gemini-1.5-pro", "gemini-2.0-flash"],
-    "Gemini-Flash": ["gemini-2.0-flash", "gemini-1.5-flash"],
-    "Llama-Ultra": ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile"],
-    "Llama-Speed": ["llama-3.1-8b-instant", "llama-3.2-3b-preview"],
-    "Mixtral": ["mixtral-8x7b-32768"],
-    "Gemini-Ref": ["gemini-1.5-pro", "gemini-1.5-flash"],
-    "Llama-Ref": ["llama-3.3-70b-versatile"],
-    "Final-Expert": ["gemini-2.0-flash", "llama-3.3-70b-versatile"]
+    "Llama-Free-1": ["meta-llama/llama-3.2-3b-instruct:free"],
+    "Llama-Free-2": ["meta-llama/llama-3.1-8b-instruct:free"],
+    "Gemma-Free": ["google/gemma-2-9b-it:free"],
+    "Mistral-Free": ["mistralai/mistral-7b-instruct:free"],
+    "Phi-Free": ["microsoft/phi-3-medium-128k-instruct:free"],
+    "Groq-Llama": ["llama-3.3-70b-versatile"],
+    "Groq-Mixtral": ["mixtral-8x7b-32768"],
+    "Backup-Flash": ["gemini-1.5-flash"] # Gemini가 살아나면 작동
 }
 
 def apply_style():
@@ -47,39 +40,37 @@ def apply_style():
         </style>
     """, unsafe_allow_html=True)
 
-# [핵심] 쿼터 초과 시 재시도하는 지능형 호출 함수
-def sync_api_call(family, model_id, prompt, retry_count=3):
+def sync_api_call(family, model_id, prompt):
     if not prompt.strip(): return ""
     session = requests.Session()
     
-    for attempt in range(retry_count):
-        try:
-            # 호출 간 미세 지연 (분당 호출 제한 방지)
-            time.sleep(attempt * 2 + 0.5) 
-            
-            if "gemini" in model_id.lower() or "Gemini" in family:
-                model = genai.GenerativeModel(model_name=model_id.split('/')[-1])
-                res = model.generate_content(prompt)
-                if res and res.text: return res.text
-            
-            else: # Groq 호출
-                r = session.post("https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                    json={"model": model_id, "messages": [{"role": "user", "content": prompt}]}, timeout=25)
-                
-                if r.status_code == 200:
-                    return r.json()['choices'][0]['message']['content']
-                elif r.status_code == 429: # 쿼터 초과 시 다음 루프에서 재시도
-                    continue
-        except Exception as e:
-            if attempt == retry_count - 1: return f"⚠️ 호출 실패: {str(e)}"
-            continue
-            
-    return f"⚠️ {family}: 쿼터 제한으로 답변을 가져오지 못했습니다. (1분 후 시도하세요)"
+    try:
+        # 1. Groq 호출 (슬롯 6, 7)
+        if "Groq" in family:
+            r = session.post("https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                json={"model": model_id, "messages": [{"role": "user", "content": prompt}]}, timeout=20)
+            if r.status_code == 200: return r.json()['choices'][0]['message']['content']
+        
+        # 2. OpenRouter 무료 모델 호출 (슬롯 1, 2, 3, 4, 5)
+        elif ":free" in model_id:
+            r = session.post("https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OR_KEY}", "HTTP-Referer": "https://streamlit.io"},
+                json={"model": model_id, "messages": [{"role": "user", "content": prompt}]}, timeout=40)
+            if r.status_code == 200: return r.json()['choices'][0]['message']['content']
+            else: return f"⚠️ OpenRouter 에러: {r.status_code} (인증 확인 필요)"
+
+        # 3. Gemini 호출 (슬롯 8)
+        else:
+            genai.configure(api_key=GEMINI_KEY)
+            model = genai.GenerativeModel(model_name=model_id)
+            res = model.generate_content(prompt)
+            return res.text
+    except Exception as e:
+        return f"⚠️ 호출 실패: {str(e)}"
 
 async def async_worker(index, family, model_id, prompt, placeholders):
-    # 각 작업 시작 시 미세한 시차를 줘서 동시 충돌 방지
-    await asyncio.sleep(index * 0.8) 
+    await asyncio.sleep(index * 1.5) # 호출 간격 더 늘림 (안전성 최우선)
     res = await asyncio.to_thread(sync_api_call, family, model_id, prompt)
     st.session_state.res_list[index] = res
     placeholders[index].markdown(f'''<div class="res-card"><span class="model-info">{index+1}. {family} • {model_id}</span>{res}</div>''', unsafe_allow_html=True)
@@ -92,13 +83,13 @@ def main():
 
     if 'res_list' not in st.session_state: st.session_state.res_list = [""] * num_models
 
-    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v3.1.0)</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v3.2.0)</h2>", unsafe_allow_html=True)
     
     with st.sidebar:
         st.write("### ⚙️ 모델 설정")
         selected = {fam: st.selectbox(f"{fam}", cfg, key=f"sel_{fam}") for fam, cfg in PRIORITY_MAP.items()}
 
-    main_q = st.text_area("Global Input", placeholder="쿼터 제한을 피하기 위해 순차적으로 호출합니다...", label_visibility="collapsed", key="g_input", height=100)
+    main_q = st.text_area("Global Input", placeholder="Gemini 할당량 초과 시 OpenRouter 무료 모델로 대체 분석합니다...", label_visibility="collapsed", key="g_input", height=100)
     
     if st.button("🔍 모든 AI 답변 동시 시작", use_container_width=True) and main_q.strip():
         cols = st.columns(2)

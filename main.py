@@ -3,7 +3,7 @@ import google.generativeai as genai
 import requests
 import asyncio
 
-# [v2.9.4] 클라이언트 설정 (무료 모델 최적화)
+# [v2.9.5] 클라이언트 설정 및 초기화
 @st.cache_resource
 def setup_clients():
     g_key = st.secrets.get("GEMINI_KEY")
@@ -17,21 +17,21 @@ def setup_clients():
                 if 'generateContent' in m.supported_generation_methods:
                     valid_gemini.append(m.name.replace("models/", ""))
         except: pass
-    if not valid_gemini: valid_gemini = ["gemini-2.0-flash", "gemini-1.5-flash"]
+    if not valid_gemini: valid_gemini = ["gemini-2.0-flash", "gemini-1.5-pro"]
     return g_key, or_key, gr_key, valid_gemini
 
 GEMINI_KEY, OR_KEY, GROQ_KEY, VALID_GEMINI = setup_clients()
 
-# [중요] 100% 무료 모델로만 구성된 우선순위 맵
+# [핵심] 최상위 모델부터 무료 모델까지의 계층형 폴백 리스트
 PRIORITY_MAP = {
-    "Gemini": VALID_GEMINI,
-    "Groq": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"], # Groq은 기본이 무료 할당량
-    "GPT": ["google/gemini-2.0-flash-001", "openai/gpt-4o-mini-2024-07-18"], # OpenRouter 내 무료/저가 모델
-    "Claude": ["anthropic/claude-3-haiku:free", "google/gemini-2.0-flash-001"],
-    "Llama": ["meta-llama/llama-3.3-70b-instruct:free", "meta-llama/llama-3.2-3b-instruct:free"],
-    "DeepSeek": ["deepseek/deepseek-r1:free", "deepseek/deepseek-chat:free"],
-    "Mistral": ["mistralai/mistral-7b-instruct:free", "mistralai/pixtral-12b:free"],
-    "Gemma": ["google/gemma-2-9b-it:free", "google/gemma-2-27b-it:free"]
+    "Gemini": VALID_GEMINI + ["gemini-1.5-flash"],
+    "Groq": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768", "llama-3.1-8b-instant"],
+    "GPT": ["openai/gpt-4o", "openai/gpt-4o-mini", "google/gemini-2.0-flash-001"], 
+    "Claude": ["anthropic/claude-3.5-sonnet", "anthropic/claude-3-haiku:free", "google/gemini-2.0-flash-001"],
+    "Llama": ["meta-llama/llama-3.3-70b-instruct", "meta-llama/llama-3.3-70b-instruct:free", "meta-llama/llama-3.2-3b-instruct:free"],
+    "DeepSeek": ["deepseek/deepseek-chat", "deepseek/deepseek-r1:free", "deepseek/deepseek-chat:free"],
+    "Mistral": ["mistralai/pixtral-12b", "mistralai/mistral-nemo:free", "mistralai/mistral-7b-instruct:free"],
+    "Gemma": ["google/gemma-2-27b-it", "google/gemma-2-9b-it:free", "google/gemma-2-27b-it:free"]
 }
 
 def apply_style():
@@ -49,9 +49,11 @@ def apply_style():
         </style>
     """, unsafe_allow_html=True)
 
+# [무한 우회 엔진] 유료 실패 시 무료 모델로 끝까지 시도
 def sync_api_call(family, model_id, prompt):
     if not prompt.strip(): return ""
     session = requests.Session()
+    # 선택된 모델을 1순위로, 나머지를 순차적으로 후보군 등록
     candidates = [model_id] + [m for m in PRIORITY_MAP.get(family, []) if m != model_id]
     
     for current_model in candidates:
@@ -65,13 +67,23 @@ def sync_api_call(family, model_id, prompt):
                     headers={"Authorization": f"Bearer {GROQ_KEY}"},
                     json={"model": current_model, "messages": [{"role": "user", "content": prompt}]}, timeout=25)
                 if r.status_code == 200: return r.json()['choices'][0]['message']['content']
-            else: # OpenRouter 무료 모델 전용 호출
+            else: # OpenRouter 계열
                 r = session.post("https://openrouter.ai/api/v1/chat/completions",
                     headers={"Authorization": f"Bearer {OR_KEY}", "HTTP-Referer": "https://streamlit.io"},
                     json={"model": current_model, "messages": [{"role": "user", "content": prompt}], "route": "fallback"}, timeout=50)
-                if r.status_code == 200: return r.json()['choices'][0]['message']['content']
-        except: continue
-    return f"⚠️ {family}: 무료 모델 호출 실패"
+                
+                # 성공 시 답변 반환
+                if r.status_code == 200:
+                    res_data = r.json()
+                    tag = "" if current_model == model_id else f"\n\n*(자동우회됨: {current_model})*"
+                    return res_data['choices'][0]['message']['content'] + tag
+                
+                # 402(잔액부족) 또는 기타 에러 시 '다음 후보(무료모델)'로 즉시 이동
+                continue 
+        except:
+            continue
+            
+    return f"⚠️ {family}: 모든 후보(무료 포함) 호출 실패"
 
 async def async_worker(index, family, model_id, prompt, placeholders):
     res = await asyncio.to_thread(sync_api_call, family, model_id, prompt)
@@ -79,7 +91,7 @@ async def async_worker(index, family, model_id, prompt, placeholders):
     placeholders[index].markdown(f'''<div class="res-card"><span class="model-info">{index+1}. {family} • {model_id.split("/")[-1]}</span>{res}</div>''', unsafe_allow_html=True)
 
 def main():
-    st.set_page_config(page_title="AI Expert 8-Arena (Free)", layout="wide")
+    st.set_page_config(page_title="AI Expert 8-Arena", layout="wide")
     apply_style()
     f_names = list(PRIORITY_MAP.keys())
     num_models = len(f_names)
@@ -87,15 +99,20 @@ def main():
     if 'res_list' not in st.session_state: st.session_state.res_list = [""] * num_models
     if 'last_in' not in st.session_state: st.session_state.last_in = [""] * num_models
 
-    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v2.9.4 Free)</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v2.9.5 Hybrid)</h2>", unsafe_allow_html=True)
     
     with st.sidebar:
-        st.write("### ⚙️ 모델 설정 (Free Only)")
+        st.write("### ⚙️ 모델 설정 (최상위 우선)")
         selected = {fam: st.selectbox(f"{fam}", cfg, key=f"sel_{fam}") for fam, cfg in PRIORITY_MAP.items()}
+        st.divider()
+        if any(st.session_state.res_list):
+            report_text = "## AI Arena 분석 리포트\n\n"
+            for i in range(num_models): report_text += f"#### {f_names[i]}\n{st.session_state.res_list[i]}\n\n"
+            st.download_button("📥 다운로드", data=report_text, file_name="arena.md", use_container_width=True)
 
-    main_q = st.text_area("Global Input", placeholder="무료 모델들로만 답변을 생성합니다...", label_visibility="collapsed", key="g_input", height=100)
+    main_q = st.text_area("Global Input", placeholder="최상위 모델부터 순차적으로 시도합니다...", label_visibility="collapsed", key="g_input", height=100)
     
-    if st.button("🔍 모든 무료 AI 답변 동시 시작", use_container_width=True) and main_q.strip():
+    if st.button("🔍 모든 AI 답변 동시 시작", use_container_width=True) and main_q.strip():
         if 'summary_res' in st.session_state: del st.session_state.summary_res
         cols = st.columns(2)
         placeholders = [cols[i % 2].empty() for i in range(num_models)]
@@ -119,7 +136,7 @@ def main():
     if any(st.session_state.res_list) and st.button("📝 모든 답변 교차 검증 및 전문가 요약", use_container_width=True):
         valid_ans = "".join([f"[{f_names[i]}]: {st.session_state.res_list[i]}\n\n" for i in range(num_models) if st.session_state.res_list[i] and "⚠️" not in st.session_state.res_list[i]])
         if valid_ans:
-            st.session_state.summary_res = sync_api_call("Gemini", selected["Gemini"], f"핵심 요약해줘:\n\n{valid_ans}")
+            st.session_state.summary_res = sync_api_call("Gemini", selected["Gemini"], f"종합 요약 및 비교:\n\n{valid_ans}")
             st.rerun()
 
     if 'summary_res' in st.session_state:

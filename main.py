@@ -4,14 +4,14 @@ import requests
 import asyncio
 import time
 
-# [v3.6.0] 클라이언트 설정
+# [v3.7.0] 클라이언트 설정
 @st.cache_resource
 def setup_clients():
     return st.secrets.get("GEMINI_KEY"), st.secrets.get("GROQ_KEY")
 
 GEMINI_KEY, GROQ_KEY = setup_clients()
 
-# [구성] Gemini 실패 시 Groq로, Groq 실패 시 Gemini로 서로 교차 백업
+# [구성] 1~4번 Gemini / 5~8번 Groq 기반 배치
 PRIORITY_MAP = {
     "1. Gemini-2.0-F": ["gemini-2.0-flash", "llama-3.3-70b-versatile"],
     "2. Gemini-1.5-P": ["gemini-1.5-pro", "mixtral-8x7b-32768"],
@@ -33,43 +33,33 @@ def apply_style():
             overflow-y: auto; font-size: 14px; border-left: 6px solid #3b82f6;
         }
         .model-info { font-size: 11px; font-weight: 800; color: #1e40af; margin-bottom: 5px; display: block; }
-        .stButton button { background-color: #ef4444 !important; color: white !important; font-weight: bold !important; border-radius: 10px !important; height: 3.5rem; }
+        .stButton button { background-color: #3b82f6 !important; color: white !important; font-weight: bold !important; border-radius: 10px !important; }
+        .summary-box { background: #f0fdf4; border: 2px solid #bbf7d0; border-radius: 15px; padding: 20px; margin-top: 20px; border-left: 10px solid #22c55e; }
         </style>
     """, unsafe_allow_html=True)
 
-# [핵심] 끈질긴 재시도 로직 (Exponential Backoff)
+# [엔진] 호출 및 재시도 로직
 def persistent_call(family, model_id, prompt):
     if not prompt.strip(): return ""
-    candidates = PRIORITY_MAP.get(family, [model_id])
+    candidates = PRIORITY_MAP.get(family, [model_id]) if isinstance(PRIORITY_MAP.get(family), list) else [model_id]
     
     for current_model in candidates:
-        for attempt in range(3): # 모델당 3번 재시도
-            try:
-                # 1. Gemini 호출
-                if "gemini" in current_model.lower():
-                    genai.configure(api_key=GEMINI_KEY)
-                    model = genai.GenerativeModel(model_name=current_model)
-                    res = model.generate_content(prompt)
-                    if res and res.text: return res.text
-                
-                # 2. Groq 호출
-                else:
-                    r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                        json={"model": current_model, "messages": [{"role": "user", "content": prompt}]}, timeout=30)
-                    if r.status_code == 200:
-                        return r.json()['choices'][0]['message']['content']
-                    elif r.status_code == 429: # 속도 제한 시 대기 후 재시도
-                        time.sleep(attempt * 5 + 3) # 3초, 8초, 13초 점점 길게 대기
-                        continue
-            except:
-                time.sleep(2)
-                continue
-    return "⚠️ 모든 엔진 응답 거부 (할당량 초기화 대기 필요)"
+        try:
+            if "gemini" in current_model.lower():
+                genai.configure(api_key=GEMINI_KEY)
+                model = genai.GenerativeModel(model_name=current_model)
+                res = model.generate_content(prompt)
+                if res and res.text: return res.text
+            else:
+                r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                    json={"model": current_model, "messages": [{"role": "user", "content": prompt}]}, timeout=30)
+                if r.status_code == 200: return r.json()['choices'][0]['message']['content']
+        except: continue
+    return "⚠️ 호출 실패 (할당량 확인)"
 
 async def async_worker(index, family, model_id, prompt, placeholders):
-    # 호출 간격을 대폭 늘려 (2초씩) 서버 부하 분산
-    await asyncio.sleep(index * 2.0)
+    await asyncio.sleep(index * 1.5)
     res = await asyncio.to_thread(persistent_call, family, model_id, prompt)
     st.session_state.res_list[index] = res
     placeholders[index].markdown(f'''<div class="res-card"><span class="model-info">{index+1}. {family}</span>{res}</div>''', unsafe_allow_html=True)
@@ -82,12 +72,12 @@ def main():
 
     if 'res_list' not in st.session_state: st.session_state.res_list = [""] * num_models
 
-    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v3.6.0)</h2>", unsafe_allow_html=True)
-    st.warning("⚠️ 현재 API 할당량이 매우 부족합니다. '저속 안전 모드'로 하나씩 천천히 불러옵니다.")
+    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v3.7.0)</h2>", unsafe_allow_html=True)
     
-    main_q = st.text_area("Global Input", placeholder="입력 후 잠시 기다려 주세요. 끈질기게 답변을 시도합니다...", key="g_input", height=100)
+    main_q = st.text_area("Global Input", placeholder="질문을 입력하세요...", key="g_input", height=100)
     
-    if st.button("🔥 할당량 뚫기: 강제 호출 시작", use_container_width=True) and main_q.strip():
+    if st.button("🔍 8개 모델 동시 분석 시작", use_container_width=True) and main_q.strip():
+        if 'summary_res' in st.session_state: del st.session_state.summary_res
         cols = st.columns(2)
         placeholders = [cols[i % 2].empty() for i in range(num_models)]
         loop = asyncio.new_event_loop()
@@ -99,7 +89,24 @@ def main():
     cols = st.columns(2)
     for i in range(num_models):
         with cols[i % 2]:
-            st.markdown(f'''<div class="res-card"><span class="model-info">{i+1}. {f_names[i]}</span>{st.session_state.res_list[i] if st.session_state.res_list[i] else "대기 중..."}</div>''', unsafe_allow_html=True)
+            st.markdown(f'''<div class="res-card"><span class="model-info">{i+1}. {f_names[i]}</span>{st.session_state.res_list[i] if st.session_state.res_list[i] else "..."}</div>''', unsafe_allow_html=True)
+
+    # --- [추가] 종합 취합 섹션 ---
+    if any(st.session_state.res_list) and st.button("📝 모든 답변 교차 분석 및 종합 요약", use_container_width=True):
+        with st.spinner("전문가 AI가 결론을 도출 중입니다..."):
+            valid_ans = ""
+            for i in range(num_models):
+                if st.session_state.res_list[i] and "⚠️" not in st.session_state.res_list[i]:
+                    valid_ans += f"### {f_names[i]}의 답변:\n{st.session_state.res_list[i]}\n\n"
+            
+            if valid_ans:
+                summary_prompt = f"다음은 동일한 질문에 대한 8개 AI 모델의 답변입니다. 이 내용들을 교차 검증하여 핵심 내용을 요약하고, 가장 신뢰할 만한 결론을 도출해 주세요:\n\n{valid_ans}"
+                # 요약도 우선순위에 따라 시도 (Gemini -> Groq)
+                st.session_state.summary_res = persistent_call("Summary-Expert", "gemini-1.5-pro", summary_prompt)
+                st.rerun()
+
+    if 'summary_res' in st.session_state:
+        st.markdown(f'<div class="summary-box"><h4>💡 전문가 종합 분석 리포트</h4>{st.session_state.summary_res}</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()

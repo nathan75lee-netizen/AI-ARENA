@@ -4,7 +4,7 @@ import requests
 import asyncio
 import time
 
-# [v3.10.5] 클라이언트 설정
+# [v3.10.6] 클라이언트 설정
 @st.cache_resource
 def setup_clients():
     return st.secrets.get("GEMINI_KEY"), st.secrets.get("GROQ_KEY")
@@ -39,15 +39,17 @@ def apply_style():
             padding: 40px; margin-top: 30px; line-height: 1.7; color: #1e293b;
             box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1);
         }
-        .report-header { text-align: center; border-bottom: 3px double #334155; padding-bottom: 20px; margin-bottom: 30px; }
-        .stButton button { width: 100%; border-radius: 12px !important; font-weight: bold !important; height: 3.5rem; transition: 0.3s; }
+        /* 리포트 내 테이블 스타일 강화 */
+        .report-container table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        .report-container th { background-color: #f8fafc; color: #1e3a8a; padding: 12px; border: 1px solid #e2e8f0; }
+        .report-container td { padding: 12px; border: 1px solid #e2e8f0; font-size: 14px; }
+        .stButton button { width: 100%; border-radius: 12px !important; font-weight: bold !important; height: 3.5rem; }
         </style>
     """, unsafe_allow_html=True)
 
 def persistent_call(family, model_id, prompt):
     if not prompt.strip(): return ""
     candidates = ["gemini-1.5-pro", "llama-3.3-70b-versatile", "gemini-2.0-flash"] if "Summary" in family else PRIORITY_MAP.get(family, [model_id])
-    
     for current_model in candidates:
         try:
             if "gemini" in current_model.lower():
@@ -61,7 +63,7 @@ def persistent_call(family, model_id, prompt):
                     json={"model": current_model, "messages": [{"role": "user", "content": prompt}]}, timeout=45)
                 if r.status_code == 200: return r.json()['choices'][0]['message']['content']
         except: continue
-    return "⚠️ 엔진 오류 (할당량 확인 필요)"
+    return "⚠️ 엔진 오류"
 
 async def async_worker(index, family, model_id, prompt, placeholders):
     await asyncio.sleep(index * 1.5)
@@ -79,9 +81,8 @@ def main():
     if 'summary_res' not in st.session_state: st.session_state.summary_res = None
 
     st.markdown("<h1 style='text-align: center; color: #1e3a8a;'>⚡ AI Expert 8-Arena</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center; color: #64748b;'>8개 모델의 교차 검증을 통한 심층 리포트 생성기</p>", unsafe_allow_html=True)
     
-    main_q = st.text_area("Global Input", placeholder="리포트 작성을 위한 질문을 입력하세요...", key="g_input", height=120)
+    main_q = st.text_area("Global Input", placeholder="분석 질문을 입력하세요...", key="g_input", height=100)
     
     if st.button("🔍 전 모델 분석 시작", type="primary") and main_q.strip():
         st.session_state.summary_res = None
@@ -98,49 +99,37 @@ def main():
         with cols[i % 2]:
             st.markdown(f'''<div class="res-card"><span class="model-info">{i+1}. {f_names[i]}</span>{st.session_state.res_list[i] if st.session_state.res_list[i] else "..."}</div>''', unsafe_allow_html=True)
 
-    # --- [리포트 생성 섹션] ---
     if any(st.session_state.res_list):
-        if st.button("📊 정식 심층 종합 리포트 발행"):
-            with st.status("전문가 데이터 분석가가 리포트를 작성 중입니다...", expanded=True) as status:
+        if st.button("📊 모델명 포함 심층 리포트 발행"):
+            with st.status("모델별 데이터를 대조하여 리포트를 구성 중입니다...", expanded=True) as status:
                 full_context = ""
                 for i in range(num_models):
                     if st.session_state.res_list[i] and "⚠️" not in st.session_state.res_list[i]:
-                        full_context += f"### [데이터 소스 {i+1}: {f_names[i]}]\n{st.session_state.res_list[i]}\n\n"
+                        full_context += f"### [Source: {f_names[i]} / Model: {PRIORITY_MAP[f_names[i]][0]}]\n{st.session_state.res_list[i]}\n\n"
                 
                 if full_context:
+                    # [핵심] 비교표에 모델명을 넣도록 프롬프트 강화
                     report_prompt = f"""
-                    당신은 수석 AI 전략가입니다. 제공된 8개 모델의 답변을 바탕으로 공식 **'AI 전문가 심층 종합 분석 리포트'**를 작성하세요.
+                    당신은 수석 AI 전략 분석가입니다. 아래 8개 모델의 답변을 바탕으로 공식 리포트를 작성하세요.
                     
-                    **[리포트 필수 구성 요소]**
-                    1. **Executive Summary**: 전체 내용을 3줄 내외로 요약.
-                    2. **Consensus (공통점)**: 모든 모델이 입을 모아 강조하는 핵심 사항들을 카테고리별로 정리.
-                    3. **Gap Analysis (차이점/논쟁점)**: 모델마다 의견이 갈리는 부분, 수치적 차이, 혹은 특정 모델만 강조한 유니크한 통찰 분석.
-                    4. **Critical Evaluation**: 어떤 답변이 가장 실무적이고 정확한지 근거와 함께 평가.
-                    5. **Action Plan (결론 및 제언)**: 사용자가 이 정보를 바탕으로 바로 실행할 수 있는 구체적인 가이드라인.
+                    **[리포트 작성 지침]**
+                    1. **Executive Summary**: 핵심 요약.
+                    2. **Model Comparison Table (필수)**: 마크다운 표를 생성하세요. 
+                       - 표의 열(Column)에 반드시 **'모델명(Model Name)'**을 명시하고, 각 모델이 제시한 핵심 답변 내용과 특징을 대조하세요.
+                    3. **Gap Analysis**: 모델 간의 의견 차이가 가장 극명한 지점을 모델명을 언급하며 분석하세요.
+                    4. **Strategic Recommendation**: 가장 신뢰도 높은 모델의 의견을 바탕으로 한 최종 제언.
 
-                    * 주의: 답변은 매우 전문적이고 격조 있는 비즈니스 톤앤매너를 유지하세요. 마크다운 표(Table)를 사용하여 비교 데이터를 시각화하세요.
+                    * 모든 분석에서 '모델 A' 같은 익명 대신, 제공된 **실제 모델 이름**을 사용하세요.
                     
-                    **[원천 데이터]**
+                    **[분석 데이터]**
                     {full_context}
                     """
                     st.session_state.summary_res = persistent_call("Summary-Expert", "gemini-1.5-pro", report_prompt)
                     status.update(label="리포트 발행 완료!", state="complete", expanded=False)
                     st.rerun()
 
-    # 리포트 출력 UI
     if st.session_state.summary_res:
-        st.markdown(f"""
-            <div class="report-container">
-                <div class="report-header">
-                    <h2 style='margin-bottom:5px;'>AI EXPERT ANALYSIS REPORT</h2>
-                    <p style='color: #64748b; font-size: 14px;'>발행일: 2026-03-30 | 분석 엔진: Multi-Model Arena v3.10.5</p>
-                </div>
-                {st.session_state.summary_res}
-                <div style='margin-top: 50px; text-align: center; font-size: 12px; color: #94a3b8; border-top: 1px solid #e2e8f0; padding-top: 20px;'>
-                    본 리포트는 Gemini-1.5-Pro 및 Llama-3.3-70B 모델의 교차 분석을 통해 생성되었습니다.
-                </div>
-            </div>
-        """, unsafe_allow_html=True)
+        st.markdown(f'<div class="report-container">{st.session_state.summary_res}</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()

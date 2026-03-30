@@ -4,7 +4,7 @@ import requests
 import asyncio
 import time
 
-# [v2.9.2] 클라이언트 설정 및 초기화
+# [v2.9.6] 클라이언트 설정
 @st.cache_resource
 def setup_clients():
     g_key = st.secrets.get("GEMINI_KEY")
@@ -18,21 +18,21 @@ def setup_clients():
                 if 'generateContent' in m.supported_generation_methods:
                     valid_gemini.append(m.name.replace("models/", ""))
         except: pass
-    if not valid_gemini: valid_gemini = ["gemini-2.0-flash", "gemini-1.5-pro"]
+    if not valid_gemini: valid_gemini = ["gemini-2.0-flash", "gemini-1.5-flash"]
     return g_key, or_key, gr_key, valid_gemini
 
 GEMINI_KEY, OR_KEY, GROQ_KEY, VALID_GEMINI = setup_clients()
 
-# 서비스별 우선순위 (고성능 -> 무료 모델 순으로 자동 우회)
+# [핵심] 최상위(유료 가능) -> 하위(무료) 모델 순서 정의
 PRIORITY_MAP = {
-    "Gemini": VALID_GEMINI,
+    "Gemini": VALID_GEMINI + ["gemini-1.5-flash"],
     "Groq": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
     "GPT": ["openai/gpt-4o", "openai/gpt-4o-mini", "google/gemini-2.0-flash-001"],
-    "Claude": ["anthropic/claude-3.5-sonnet", "anthropic/claude-3-haiku:free"],
+    "Claude": ["anthropic/claude-3.5-sonnet", "anthropic/claude-3-haiku:free", "google/gemini-2.0-flash-001"],
     "Llama": ["meta-llama/llama-3.3-70b-instruct", "meta-llama/llama-3.3-70b-instruct:free", "meta-llama/llama-3.2-3b-instruct:free"],
-    "DeepSeek": ["deepseek/deepseek-chat", "deepseek/deepseek-r1:free", "deepseek/deepseek-chat:free"],
-    "Mistral": ["mistralai/pixtral-12b", "mistralai/mistral-nemo:free"],
-    "Gemma": ["google/gemma-2-27b-it", "google/gemma-2-9b-it:free"]
+    "DeepSeek": ["deepseek/deepseek-chat", "deepseek/deepseek-r1:free", "mistralai/mixtral-8x7b-instruct:free"],
+    "Mistral": ["mistralai/pixtral-12b", "mistralai/mistral-nemo:free", "mistralai/mistral-7b-instruct:free"],
+    "Gemma": ["google/gemma-2-27b-it", "google/gemma-2-9b-it:free", "google/gemma-2-27b-it:free"]
 }
 
 def apply_style():
@@ -50,10 +50,11 @@ def apply_style():
         </style>
     """, unsafe_allow_html=True)
 
-# [수정 핵심] 3,4,5,6번 호출 실패를 방지하는 강화된 통신 엔진
+# [수정] 3~8번 모델이 실패할 때 끝까지 무료 모델로 찾아가는 엔진
 def sync_api_call(family, model_id, prompt):
     if not prompt.strip(): return ""
     session = requests.Session()
+    # 선택된 모델을 1순위로, 그 뒤에 해당 카테고리의 모든 모델(무료 포함)을 후보로 등록
     candidates = [model_id] + [m for m in PRIORITY_MAP.get(family, []) if m != model_id]
     
     for current_model in candidates:
@@ -61,38 +62,36 @@ def sync_api_call(family, model_id, prompt):
             if family == "Gemini":
                 model = genai.GenerativeModel(model_name=current_model.split('/')[-1])
                 res = model.generate_content(prompt)
-                if res and res.text:
-                    tag = "" if current_model == model_id else f"\n\n*(자동우회: {current_model})*"
-                    return res.text + tag
+                if res and res.text: return res.text
             elif family == "Groq":
                 r = session.post("https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                    json={"model": current_model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1024}, timeout=25)
-                if r.status_code == 200:
-                    tag = "" if current_model == model_id else f"\n\n*(자동우회: {current_model})*"
-                    return r.json()['choices'][0]['message']['content'] + tag
-            else: # [여기서 3,4,5,6번 처리] OpenRouter 호출부 정밀 수정
+                    json={"model": current_model, "messages": [{"role": "user", "content": prompt}]}, timeout=25)
+                if r.status_code == 200: return r.json()['choices'][0]['message']['content']
+            else: # OpenRouter (GPT, Claude, Llama, DeepSeek, Mistral, Gemma)
                 r = session.post("https://openrouter.ai/api/v1/chat/completions",
                     headers={
                         "Authorization": f"Bearer {OR_KEY}",
-                        "HTTP-Referer": "https://streamlit.io", # 리퍼러 정상화
-                        "X-Title": "AI Expert Arena"
+                        "HTTP-Referer": "https://streamlit.io",
+                        "X-Title": "AI Arena"
                     },
                     json={
                         "model": current_model, 
                         "messages": [{"role": "user", "content": prompt}],
-                        "route": "fallback" # 유료 실패 시 자동 우회
-                    }, timeout=60) # 타임아웃 60초로 연장
+                        "route": "fallback" # 유료 실패 시 시스템 차원 우회
+                    }, timeout=60) # 타임아웃 1분으로 연장
                 
                 if r.status_code == 200:
-                    res = r.json()
+                    res_data = r.json()
+                    content = res_data['choices'][0]['message']['content']
                     tag = "" if current_model == model_id else f"\n\n*(자동우회: {current_model})*"
-                    return res['choices'][0]['message']['content'] + tag
+                    return content + tag
                 
-                # 402(잔액부족), 429(속도제한) 등 발생 시 다음 후보(무료모델)로 계속 시도
+                # 402(잔액부족) 등 에러 발생 시 '다음 후보(무료모델)'로 즉시 이동
                 continue 
-        except Exception:
-            continue
+        except:
+            continue # 연결 오류 시 다음 후보 시도
+            
     return f"⚠️ {family}: 모든 후보 모델 호출 실패"
 
 async def async_worker(index, family, model_id, prompt, placeholders):
@@ -109,7 +108,7 @@ def main():
     if 'res_list' not in st.session_state: st.session_state.res_list = [""] * num_models
     if 'last_in' not in st.session_state: st.session_state.last_in = [""] * num_models
 
-    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v2.9.2-Rev)</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align: center;'>⚡ AI Expert 8-Arena (v2.9.6-Rev)</h2>", unsafe_allow_html=True)
     
     with st.sidebar:
         st.write("### ⚙️ 모델 설정")
@@ -118,14 +117,12 @@ def main():
         if any(st.session_state.res_list):
             report_text = "## AI Arena 분석 리포트\n\n"
             for i in range(num_models): report_text += f"#### {f_names[i]}\n{st.session_state.res_list[i]}\n\n"
-            st.download_button("📥 결과 다운로드 (.md)", data=report_text, file_name="arena_report.md", use_container_width=True)
+            st.download_button("📥 결과 다운로드", data=report_text, file_name="arena.md", use_container_width=True)
 
-    main_q = st.text_area("Global Input", placeholder="고성능 모델부터 순차적으로 시도합니다...", label_visibility="collapsed", key="g_input", height=100)
+    main_q = st.text_area("Global Input", placeholder="최상위 모델부터 순차적으로 시도합니다...", label_visibility="collapsed", key="g_input", height=100)
     
     if st.button("🔍 모든 AI 답변 동시 시작", use_container_width=True) and main_q.strip():
-        if 'summary_res' in st.session_state:
-            del st.session_state.summary_res
-        
+        if 'summary_res' in st.session_state: del st.session_state.summary_res
         cols = st.columns(2)
         placeholders = [cols[i % 2].empty() for i in range(num_models)]
         loop = asyncio.new_event_loop()
@@ -145,14 +142,11 @@ def main():
                 st.session_state.res_list[i] = sync_api_call(fam, selected[fam], ind_q)
                 st.rerun()
 
-    st.divider()
-    if st.button("📝 모든 답변 교차 검증 및 전문가 요약", use_container_width=True):
+    if any(st.session_state.res_list) and st.button("📝 모든 답변 교차 검증 및 전문가 요약", use_container_width=True):
         valid_ans = "".join([f"[{f_names[i]}]: {st.session_state.res_list[i]}\n\n" for i in range(num_models) if st.session_state.res_list[i] and "⚠️" not in st.session_state.res_list[i]])
         if valid_ans:
-            with st.spinner("정보의 일관성을 정밀 분석 중..."):
-                v_prompt = f"다음 답변들을 종합해서 결론 도출해줘:\n\n{valid_ans}"
-                st.session_state.summary_res = sync_api_call("Gemini", selected["Gemini"], v_prompt)
-                st.rerun()
+            st.session_state.summary_res = sync_api_call("Gemini", selected["Gemini"], f"결론 도출해줘:\n\n{valid_ans}")
+            st.rerun()
 
     if 'summary_res' in st.session_state:
         st.markdown(f'<div class="summary-box"><h4>💡 종합 분석 리포트</h4>{st.session_state.summary_res}</div>', unsafe_allow_html=True)

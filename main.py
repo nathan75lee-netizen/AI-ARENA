@@ -4,7 +4,7 @@ import requests
 import asyncio
 import time
 
-# [v2.5.5 엔진 복구] 모델 설정 및 API 키 확인
+# [v2.5.5 엔진 기반] 클라이언트 설정
 @st.cache_resource
 def setup_clients():
     g_key = st.secrets.get("GEMINI_KEY")
@@ -23,7 +23,6 @@ def setup_clients():
 
 GEMINI_KEY, OR_KEY, GROQ_KEY, VALID_GEMINI = setup_clients()
 
-# v2.5.5 고정 라인업 (안정성 검증됨)
 MODEL_CONFIG = {
     "Gemini": VALID_GEMINI,
     "Groq": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
@@ -50,7 +49,7 @@ def apply_style():
         </style>
     """, unsafe_allow_html=True)
 
-# [CRITICAL] v2.5.5의 순수 API 호출 로직으로 100% 원복 (에러 방지)
+# [핵심 수리] API 응답 구조를 안전하게 파싱하는 엔진
 def sync_api_call(family, model_id, prompt):
     if not prompt.strip(): return ""
     session = requests.Session()
@@ -58,20 +57,28 @@ def sync_api_call(family, model_id, prompt):
         if family == "Gemini":
             model = genai.GenerativeModel(model_name=model_id.split('/')[-1])
             return model.generate_content(prompt).text
+        
         elif family == "Groq":
             r = session.post("https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_KEY}"},
                 json={"model": model_id, "messages": [{"role": "user", "content": prompt}]}, timeout=20)
-            return r.json()['choices'][0]['message']['content']
-        else:
+            res_json = r.json()
+            if 'choices' in res_json:
+                return res_json['choices'][0]['message']['content']
+            return f"⚠️ Groq 에러: {res_json.get('error', {}).get('message', '알 수 없는 오류')}"
+            
+        else: # OpenRouter 계열 (GPT, Claude, DeepSeek 등)
             r = session.post("https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OR_KEY}", "HTTP-Referer": "http://localhost:8501"},
                 json={"model": model_id, "messages": [{"role": "user", "content": prompt}]}, timeout=45)
-            # v2.5.5와 동일한 응답 파싱 구조 유지
-            return r.json()['choices'][0]['message']['content']
+            res_json = r.json()
+            # [수정 포인트] 'choices'가 없을 경우 에러 메시지를 직접 반환하여 앱 중단 방지
+            if 'choices' in res_json:
+                return res_json['choices'][0]['message']['content']
+            return f"⚠️ API 에러: {res_json.get('error', {}).get('message', '잔액 부족 또는 모델 호출 불가')}"
+            
     except Exception as e:
-        # 에러 발생 시 사용자에게 명확한 메시지 전달
-        return f"⚠️ 서버 응답 지연 또는 설정 오류 (Error: {str(e)[:30]})"
+        return f"⚠️ 연결 오류: {str(e)[:40]}"
 
 async def async_worker(index, family, model_id, prompt, placeholders):
     res = await asyncio.to_thread(sync_api_call, family, model_id, prompt)
@@ -93,13 +100,12 @@ def main():
         st.write("### ⚙️ 모델 설정")
         selected = {fam: st.selectbox(f"{fam}", cfg, key=f"sel_{fam}") for fam, cfg in MODEL_CONFIG.items()}
         st.divider()
-        # [기능 1] 리포트 다운로드 (v2.5.5 사이드바 구조 유지하며 추가)
         if any(st.session_state.res_list):
             report_text = "## AI Arena 분석 결과 보고서\n\n"
             for i in range(num_models): report_text += f"### {f_names[i]} ({selected[f_names[i]]})\n{st.session_state.res_list[i]}\n\n"
-            st.download_button("📥 전체 답변 다운로드 (.md)", data=report_text, file_name="arena_result.md", use_container_width=True)
+            st.download_button("📥 결과 다운로드 (.md)", data=report_text, file_name="arena_report.md", use_container_width=True)
 
-    main_q = st.text_area("Global Input", placeholder="8개 AI에게 동시 질문...", label_visibility="collapsed", key="g_input", height=100)
+    main_q = st.text_area("Global Input", placeholder="질문을 입력하세요...", label_visibility="collapsed", key="g_input", height=100)
     
     if st.button("🔍 모든 AI 답변 동시 시작", use_container_width=True) and main_q.strip():
         cols = st.columns(2)
@@ -115,25 +121,24 @@ def main():
         fam = f_names[i]
         with cols[i % 2]:
             st.markdown(f'''<div class="res-card"><span class="model-info">{i+1}. {fam} • {selected[fam].split("/")[-1]}</span>{st.session_state.res_list[i] if st.session_state.res_list[i] else "..."}</div>''', unsafe_allow_html=True)
-            ind_q = st.text_input(f"q_{i}", key=f"ind_{i}", placeholder=f"{fam} 전용 개별 질문", label_visibility="collapsed")
+            ind_q = st.text_input(f"q_{i}", key=f"ind_{i}", placeholder=f"{fam} 전용 질문", label_visibility="collapsed")
             if ind_q.strip() and ind_q != st.session_state.last_in[i]:
                 st.session_state.last_in[i] = ind_q
                 st.session_state.res_list[i] = sync_api_call(fam, selected[fam], ind_q)
                 st.rerun()
 
-    # [기능 2] 교차 검증 요약 (v2.5.5 메인 엔진에 영향 없음)
+    # 교차 검증 요약
     st.divider()
-    if st.button("📝 전문가 의견 교차 검증 및 취합 요약", use_container_width=True):
-        all_ans = "".join([f"[{f_names[i]}]: {st.session_state.res_list[i]}\n\n" for i in range(num_models) if st.session_state.res_list[i]])
+    if st.button("📝 모든 답변 교차 검증 및 취합 요약", use_container_width=True):
+        all_ans = "".join([f"[{f_names[i]}]: {st.session_state.res_list[i]}\n\n" for i in range(num_models) if st.session_state.res_list[i] and "⚠️" not in st.session_state.res_list[i]])
         if all_ans:
-            with st.spinner("전문가 답변을 정밀 분석 중..."):
-                # 취합용 프롬프트 최적화
-                v_prompt = f"다음은 8개 AI의 전문 답변입니다. 팩트 중심의 공통점과 각 모델별 특이 의견을 구분하여 결론을 도출해줘:\n\n{all_ans}"
+            with st.spinner("전문가 답변 분석 중..."):
+                v_prompt = f"다음은 여러 AI의 답변입니다. 서로 공통된 부분과 의견이 갈리는 부분(충돌 지점)을 정리하고, 실시간 팩트체크를 바탕으로 최종 결론을 내주세요:\n\n{all_ans}"
                 st.session_state.summary_res = sync_api_call("Claude", selected["Claude"], v_prompt)
                 st.rerun()
 
     if 'summary_res' in st.session_state:
-        st.markdown(f'<div class="summary-box"><h4>💡 종합 분석 리포트</h4>{st.session_state.summary_res}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="summary-box"><h4>💡 교차 검증 요약</h4>{st.session_state.summary_res}</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()

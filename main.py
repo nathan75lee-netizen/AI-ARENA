@@ -4,7 +4,7 @@ import requests
 import asyncio
 import time
 
-# [v2.5.5 기준] 8개 계열 고정 및 API 설정
+# [v2.7.1] v2.5.5 기반 + 네트워크 예외 처리 강화 + 답변 취합 기능
 @st.cache_resource
 def setup_clients():
     g_key = st.secrets.get("GEMINI_KEY")
@@ -23,7 +23,7 @@ def setup_clients():
 
 GEMINI_KEY, OR_KEY, GROQ_KEY, VALID_GEMINI = setup_clients()
 
-# v2.5.5 고정 모델 라인업
+# v2.5.5 고정 계열 (사용자 지정 라인업)
 MODEL_CONFIG = {
     "Gemini": VALID_GEMINI,
     "Groq": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
@@ -43,6 +43,7 @@ def apply_style():
             background: white; border: 1px solid #e2e8f0; border-radius: 12px; 
             padding: 16px; margin-bottom: 5px; min-height: 120px; max-height: 400px; 
             overflow-y: auto; font-size: 14px; border-left: 6px solid #3b82f6;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
         }
         .model-info { font-size: 11px; font-weight: 800; color: #1e40af; margin-bottom: 5px; display: block; }
         .stButton button { 
@@ -50,10 +51,9 @@ def apply_style():
             font-weight: bold !important; border-radius: 10px !important;
             height: 3.5rem;
         }
-        /* 요약 섹션 스타일 */
         .summary-box {
-            background: #fdf6e3; border: 2px solid #eee8d5; border-radius: 15px;
-            padding: 20px; margin-top: 20px; border-left: 10px solid #b58900;
+            background: #f0fdf4; border: 2px solid #bbf7d0; border-radius: 15px;
+            padding: 20px; margin-top: 20px; border-left: 10px solid #22c55e;
         }
         </style>
     """, unsafe_allow_html=True)
@@ -61,22 +61,32 @@ def apply_style():
 def sync_api_call(family, model_id, prompt):
     if not prompt.strip(): return ""
     session = requests.Session()
-    try:
-        if family == "Gemini":
-            model = genai.GenerativeModel(model_name=model_id.split('/')[-1])
-            return model.generate_content(prompt).text
-        elif family == "Groq":
-            r = session.post("https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                json={"model": model_id, "messages": [{"role": "user", "content": prompt}]}, timeout=20)
-            return r.json()['choices'][0]['message']['content']
-        else:
-            r = session.post("https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OR_KEY}", "HTTP-Referer": "http://localhost:8501"},
-                json={"model": model_id, "messages": [{"role": "user", "content": prompt}]}, timeout=45)
-            return r.json()['choices'][0]['message']['content']
-    except Exception as e:
-        return f"⚠️ 에러 발생: {str(e)[:50]}"
+    # 네트워크 오류 시 최대 2회 재시도
+    for attempt in range(2):
+        try:
+            if family == "Gemini":
+                model = genai.GenerativeModel(model_name=model_id.split('/')[-1])
+                return model.generate_content(prompt).text
+            elif family == "Groq":
+                r = session.post("https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                    json={"model": model_id, "messages": [{"role": "user", "content": prompt}]}, timeout=15)
+                return r.json()['choices'][0]['message']['content']
+            else:
+                r = session.post("https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {OR_KEY}", "HTTP-Referer": "http://localhost:8501"},
+                    json={"model": model_id, "messages": [{"role": "user", "content": prompt}]}, timeout=25)
+                data = r.json()
+                if 'choices' in data:
+                    return data['choices'][0]['message']['content']
+                return f"⚠️ API 메시지: {data.get('error', {}).get('message', '응답 없음')}"
+        except requests.exceptions.RequestException:
+            if attempt == 0:
+                time.sleep(2) # 2초 대기 후 재시도
+                continue
+            return "⚠️ 네트워크 연결 오류 (OpenRouter 접속 불가). 인터넷 상태를 확인하세요."
+        except Exception as e:
+            return f"⚠️ 기타 오류: {str(e)[:50]}"
 
 async def async_worker(index, family, model_id, prompt, placeholders):
     res = await asyncio.to_thread(sync_api_call, family, model_id, prompt)
@@ -116,7 +126,7 @@ def main():
 
     st.divider()
 
-    # 8개 답변 카드 영역
+    # 8개 답변 카드
     cols = st.columns(2)
     for i in range(num_models):
         with cols[i % 2]:
@@ -133,7 +143,7 @@ def main():
                 st.session_state.res_list[i] = sync_api_call(fam, selected[fam], ind_q)
                 st.rerun()
 
-    # --- [추가 기능] 답변 취합 요약 ---
+    # --- 취합 요약 섹션 ---
     st.divider()
     if st.button("📝 모든 답변 취합하여 결론 도출", use_container_width=True):
         all_text = ""
@@ -142,22 +152,16 @@ def main():
                 all_text += f"[{name}의 답변]:\n{st.session_state.res_list[i]}\n\n"
         
         if all_text:
-            with st.spinner("전문가들의 의견을 종합 중..."):
-                # 취합용 프롬프트
-                summary_prompt = f"다음은 8개 AI의 답변입니다. 핵심 내용을 대조하여 가장 정확한 결론을 도출해 주세요:\n\n{all_text}"
-                # Claude 모델을 사용하여 요약 진행 (사이드바에서 선택된 모델 사용)
+            with st.spinner("전문가 의견 종합 중..."):
+                summary_prompt = f"다음은 8개 AI의 답변입니다. 핵심을 대조하여 최종 결론을 요약해 주세요:\n\n{all_text}"
+                # Claude 계열 모델로 요약
                 summary = sync_api_call("Claude", selected["Claude"], summary_prompt)
                 st.session_state.summary_res = summary
         else:
             st.warning("먼저 답변을 생성해 주세요.")
 
     if 'summary_res' in st.session_state:
-        st.markdown(f'''
-            <div class="summary-box">
-                <h4 style="margin-top:0;">💡 종합 분석 결과</h4>
-                {st.session_state.summary_res}
-            </div>
-        ''', unsafe_allow_html=True)
+        st.markdown(f'''<div class="summary-box"><h4>💡 종합 분석 결과</h4>{st.session_state.summary_res}</div>''', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()

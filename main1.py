@@ -18,105 +18,82 @@ def get_key(name):
 G_KEY = get_key("GEMINI_KEY")
 Q_KEY = get_key("GROQ_KEY")
 
-def scan_and_filter_models():
-    """단순 스캔이 아니라, 실제 대화가 가능한 '품질 좋은' 모델만 선별"""
-    models = {"G": [], "Q": []}
-    
-    # 1. Gemini 스캔 (Flash 1.5 이상 권장)
-    if G_KEY:
-        try:
-            r = requests.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={G_KEY}", timeout=10)
+def scan_all_engines():
+    """가용 모델을 긁어오되, 실패를 대비해 하드코딩된 백업 리스트를 병합"""
+    models = {"G": ["gemini-1.5-flash", "gemini-1.5-pro"], "Q": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]}
+    try:
+        if G_KEY:
+            r = requests.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={G_KEY}", timeout=5)
             if r.status_code == 200:
-                raw = r.json().get('models', [])
-                # 'flash'나 'pro'가 들어간 모델 위주로 선별
-                models["G"] = [m['name'] for m in raw if ('flash' in m['name'].lower() or 'pro' in m['name'].lower()) and "vision" not in m['name']]
-        except: pass
-
-    # 2. Groq 스캔 (Prompt-guard 같은 필터 모델 제외)
-    if Q_KEY:
-        try:
-            r = requests.get("https://api.groq.com/openai/v1/models", headers={"Authorization": f"Bearer {Q_KEY}"}, timeout=10)
+                models["G"] = [m['name'] for m in r.json().get('models', []) if 'generateContent' in m.get('supportedGenerationMethods', []) and "vision" not in m['name']]
+        if Q_KEY:
+            r = requests.get("https://api.groq.com/openai/v1/models", headers={"Authorization": f"Bearer {Q_KEY}"}, timeout=5)
             if r.status_code == 200:
-                raw = r.json().get('data', [])
-                # 보안용(guard), 소형(8b 미만) 모델 제외하고 고성능(llama-3, mixtral) 위주로 필터링
-                models["Q"] = [m['id'] for m in raw if "guard" not in m['id'].lower() and ("llama-3" in m['id'].lower() or "mixtral" in m['id'].lower() or "70b" in m['id'].lower())]
-        except: pass
+                models["Q"] = [m['id'] for m in r.json().get('data', []) if "guard" not in m['id'].lower()]
+    except: pass
     return models
 
-def call_elite_relay(engine, m_list, prompt, role):
-    """엄선된 모델 리스트를 순회하며 400/429 방어 호출"""
-    headers = {"Content-Type": "application/json"}
-    if not m_list: return None, "No High-Quality Models Found"
+def universal_call(prompt, role, primary_engine, model_pool):
+    """지정한 엔진이 실패하면 다른 엔진의 모델로 즉시 전환하여 답변 사수"""
+    # 1차 시도: 기본 지정 엔진
+    for m_id in model_pool[primary_engine][:3]:
+        ans, err = execute_request(primary_engine, m_id, prompt, role)
+        if ans: return ans, f"{primary_engine} ({m_id})"
+        if "429" in err: time.sleep(10) # 429일 경우만 조금 더 대기
 
-    for m_id in m_list[:3]: # 최상위 3개 고성능 모델만 시도
-        try:
-            if engine == "G":
-                url = f"https://generativelanguage.googleapis.com/v1beta/{m_id}:generateContent?key={G_KEY}"
-                payload = {"contents": [{"parts": [{"text": f"당신은 {role} 전문가입니다. 다음 질문에 상세히 답하세요: {prompt}"}]}]}
-            else:
-                url = "https://api.groq.com/openai/v1/chat/completions"
-                headers["Authorization"] = f"Bearer {Q_KEY}"
-                # 400 방지: 가장 표준적인 채팅 구조 사용
-                payload = {
-                    "model": m_id,
-                    "messages": [{"role": "user", "content": f"지시: 당신은 {role}입니다. 질문: {prompt}"}],
-                    "temperature": 0.5
-                }
-            
-            r = requests.post(url, json=payload, headers=headers, timeout=25)
-            
-            if r.status_code == 200:
-                if engine == "G": return r.json()['candidates'][0]['content']['parts'][0]['text'], f"Success ({m_id})"
-                return r.json()['choices'][0]['message']['content'], f"Success ({m_id})"
-            
-            # 실패 시 로그 출력 후 다음 모델로
-            st.warning(f"⚠️ {role}({m_id}) 실패: {r.status_code}. 다음 모델 시도 중...")
-            time.sleep(2)
-            continue
-        except:
-            continue
-    return None, "모든 고성능 모델 호출 실패"
+    # 2차 시도: 다른 엔진으로 교체 (Cross-Engine Failover)
+    backup_engine = "Q" if primary_engine == "G" else "G"
+    for m_id in model_pool[backup_engine][:2]:
+        ans, err = execute_request(backup_engine, m_id, prompt, role)
+        if ans: return ans, f"Backup: {backup_engine} ({m_id})"
+    
+    return None, "모든 엔진 및 모델 호출 실패"
+
+def execute_request(eng, m_id, prompt, role):
+    try:
+        if eng == "G":
+            url = f"https://generativelanguage.googleapis.com/v1beta/{m_id}:generateContent?key={G_KEY}"
+            payload = {"contents": [{"parts": [{"text": f"Role: {role}\nTopic: {prompt}"}]}]}
+            r = requests.post(url, json=payload, timeout=20)
+        else:
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            r = requests.post(url, headers={"Authorization": f"Bearer {Q_KEY}"}, json={"model": m_id, "messages": [{"role": "user", "content": f"As {role}, answer: {prompt}"}]}, timeout=20)
+        
+        if r.status_code == 200:
+            if eng == "G": return r.json()['candidates'][0]['content']['parts'][0]['text'], "Success"
+            return r.json()['choices'][0]['message']['content'], "Success"
+        return None, str(r.status_code)
+    except: return None, "Error"
 
 # --- UI ---
-st.set_page_config(page_title="Arena v25.5", layout="wide")
-st.title("🏛️ 아레나 v25.5 (고성능 모델 정밀 필터링)")
+st.set_page_config(page_title="Arena v26.0", layout="wide")
+st.title("🏛️ 아레나 v26.0 (엔진 크로스 페일오버)")
 
-if 'elite_pool' not in st.session_state:
-    st.session_state.elite_pool = {"G": [], "Q": []}
+if 'full_pool' not in st.session_state:
+    st.session_state.full_pool = scan_all_engines()
 
 with st.sidebar:
-    if st.button("🔍 고성능 모델 스캔", type="primary"):
-        st.session_state.elite_pool = scan_and_filter_models()
-        st.success(f"엄선 완료! G:{len(st.session_state.elite_pool['G'])} / Q:{len(st.session_state.elite_pool['Q'])}")
+    if st.button("🔄 엔진 상태 새로고침"):
+        st.session_state.full_pool = scan_all_engines()
+        st.success("새로고침 완료")
 
-topic = st.text_input("토론 주제 입력")
+topic = st.text_input("토론 주제")
 
-if st.button("🚀 아레나 가동") and topic:
-    p = st.session_state.elite_pool
-    if not p["G"] and not p["Q"]:
-        st.error("사이드바에서 먼저 [모델 스캔]을 실행하세요.")
-        st.stop()
-
-    # 역할 배정 로직 (품질 순)
-    experts = [
-        ("G", p["G"], "전략가"), # Gemini 최우선
-        ("Q", p["Q"], "기술자"), # Groq 고성능(70B 등) 최우선
-        ("Q", p["Q"][1:] if len(p["Q"]) > 1 else p["G"][1:], "리스크")
-    ]
-
+if st.button("🚀 아레나 강제 가동") and topic:
+    pool = st.session_state.full_pool
+    experts = [("전략가", "G"), ("기술자", "Q"), ("리스크", "Q")]
     cols = st.columns(3)
     logs = []
 
-    for i, (eng, m_list, role) in enumerate(experts):
+    for i, (role, eng) in enumerate(experts):
         with cols[i]:
-            with st.spinner(f"{role} 엄선 모델 소환 중..."):
-                time.sleep(3) # 429 방어용 간격
-                ans, status = call_elite_relay(eng, m_list, topic, role)
+            with st.spinner(f"{role} 소환 시도 중..."):
+                time.sleep(5) # 엔진 부하 방지용 강제 휴식
+                ans, status = universal_call(topic, role, eng, pool)
                 if ans:
                     st.success(f"**{role}** 입정")
                     st.caption(status)
-                    st.write(ans)
+                    st.write(ans[:800] + "...")
                     logs.append(ans)
                 else:
                     st.error(f"**{role} 최종 실패**")
-                    st.code(status)
